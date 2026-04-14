@@ -1,0 +1,23 @@
+[Unit]
+Description=Bitcoin Solo CPU Miner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sysconfig/btc-solo-cpu
+User=solominer
+Group=solominer
+WorkingDirectory=/opt/cpuminer-opt
+ExecStart=/opt/cpuminer-opt/cpuminer -a sha256d -o ${POOL} -u ${WALLET}.${WORKER} -p x -t ${THREADS}
+Restart=always
+RestartSec=10
+Nice=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/cpuminer-opt
+
+[Install]
+WantedBy=multi-user.target
