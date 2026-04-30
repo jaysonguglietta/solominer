@@ -24,8 +24,8 @@ This project is aimed at people who want to run a "lottery miner" on machines th
 
 These instructions are written around the public NerdMiner-compatible endpoint:
 
-- Primary: `stratum+tcp://pool.nerdminer.de:3333`
-- Fallback: `stratum+tcp://pool.nerdminer.io:3333`
+- Primary: `stratum+tcp://pool.nerdminer.io:3333`
+- Alternate: `stratum+tcp://pool.nerdminer.de:3333`
 
 If you prefer, you can also swap in another solo pool endpoint such as Solo CKPool.
 
@@ -37,6 +37,13 @@ If you prefer, you can also swap in another solo pool endpoint such as Solo CKPo
 - Root or sudo access
 
 ## Clone This Repository
+
+```bash
+git clone https://github.com/jaysonguglietta/solominer.git
+cd solominer
+```
+
+If you prefer SSH:
 
 ```bash
 git clone git@github.com:jaysonguglietta/solominer.git
@@ -110,16 +117,16 @@ Replace `YOUR_BTC_ADDRESS` and choose a worker name such as `fedora1`.
 
 ```bash
 sudo -u solominer /opt/cpuminer-opt/cpuminer -a sha256d \
-  -o stratum+tcp://pool.nerdminer.de:3333 \
+  -o stratum+tcp://pool.nerdminer.io:3333 \
   -u YOUR_BTC_ADDRESS.fedora1 \
   -p x \
   -t 2
 ```
 
-If the `.de` endpoint does not connect, retry with:
+If the `.io` endpoint does not connect, retry with:
 
 ```bash
-stratum+tcp://pool.nerdminer.io:3333
+stratum+tcp://pool.nerdminer.de:3333
 ```
 
 Stop the manual test with `Ctrl+C` after confirming it connects and starts hashing.
@@ -149,7 +156,7 @@ Set these values:
 Example:
 
 ```bash
-POOL=stratum+tcp://pool.nerdminer.de:3333
+POOL=stratum+tcp://pool.nerdminer.io:3333
 WALLET=bc1qexampleexampleexampleexampleexample
 WORKER=fedora1
 THREADS=2
@@ -335,7 +342,7 @@ If the service points to `/tmp/cpuminer-opt`, move the miner to `/opt/cpuminer-o
 Try the fallback endpoint:
 
 ```bash
-POOL=stratum+tcp://pool.nerdminer.io:3333
+POOL=stratum+tcp://pool.nerdminer.de:3333
 ```
 
 Then restart:
