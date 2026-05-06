@@ -282,17 +282,31 @@ This includes packages such as:
 
 ### Update the Miner
 
-The miner binary installed under `/opt/cpuminer-opt` does not update itself. Rebuild it manually:
+The miner binary installed under `/opt/cpuminer-opt` does not update itself. Rebuild it with the maintenance script:
 
 ```bash
-cd /tmp
-rm -rf /tmp/cpuminer-opt
-git clone https://github.com/JayDDee/cpuminer-opt.git
-cd /tmp/cpuminer-opt
-./build.sh
-sudo cp -f /tmp/cpuminer-opt/cpuminer /opt/cpuminer-opt/cpuminer
-sudo chown solominer:solominer /opt/cpuminer-opt/cpuminer
-sudo systemctl restart btc-solo-cpu.service
+chmod +x scripts/update-solominer.sh
+sudo ./scripts/update-solominer.sh
+```
+
+That script:
+
+- updates Fedora packages with `dnf`
+- clones and rebuilds `cpuminer-opt`
+- replaces `/opt/cpuminer-opt/cpuminer`
+- restarts `btc-solo-cpu.service`
+- prints service status, recent logs, and temperatures
+
+If you want to skip Fedora package updates and only rebuild the miner:
+
+```bash
+sudo UPDATE_PACKAGES=0 ./scripts/update-solominer.sh
+```
+
+If you want to update packages and rebuild the miner without restarting the service yet:
+
+```bash
+sudo RESTART_SERVICE=0 ./scripts/update-solominer.sh
 ```
 
 ### Change Wallet, Worker, Pool, or Threads
