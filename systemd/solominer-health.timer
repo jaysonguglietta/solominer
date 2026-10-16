@@ -1,0 +1,12 @@
+[Unit]
+Description=Check SoloMiner health every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=20s
+Unit=solominer-health.service
+
+[Install]
+WantedBy=timers.target

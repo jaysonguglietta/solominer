@@ -1,0 +1,43 @@
+[Unit]
+Description=SoloMiner local health and recovery alerts
+After=btc-solo-cpu.service
+
+[Service]
+Type=oneshot
+User=solominer-health
+Group=solominer-health
+SupplementaryGroups=solominer systemd-journal
+ExecStart=/usr/local/bin/solominer health
+StateDirectory=solominer-health
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=45
+CPUQuota=25%
+MemoryMax=128M
+TasksMax=16
+LimitCORE=0
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solominer-health

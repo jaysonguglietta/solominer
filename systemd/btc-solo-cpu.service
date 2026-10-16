@@ -1,23 +1,53 @@
 [Unit]
-Description=Bitcoin Solo CPU Miner
+Description=Bitcoin Solo CPU Miner (managed by SoloMiner)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/sysconfig/btc-solo-cpu
 User=solominer
 Group=solominer
 WorkingDirectory=/opt/cpuminer-opt
-ExecStart=/opt/cpuminer-opt/cpuminer -a sha256d -o ${POOL} -u ${WALLET}.${WORKER} -p x -t ${THREADS}
+ExecStart=/usr/local/bin/solominer run
 Restart=always
-RestartSec=10
+RestartSec=30
+TimeoutStopSec=20
 Nice=15
+UMask=0077
+CPUAccounting=true
+MemoryAccounting=true
+TasksAccounting=true
+# The installer writes validated per-host settings to a managed drop-in.
+CPUQuota=100%
+MemoryMax=256M
+TasksMax=64
+LimitCORE=0
 NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
 PrivateTmp=true
+PrivateDevices=true
 ProtectHome=true
-ProtectSystem=full
-ReadWritePaths=/opt/cpuminer-opt
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solominer
 
 [Install]
 WantedBy=multi-user.target

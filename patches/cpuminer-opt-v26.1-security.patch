@@ -1,0 +1,941 @@
+diff --git a/sysinfos.c b/sysinfos.c
+index 36d6d1f..274fca0 100644
+--- a/sysinfos.c
++++ b/sysinfos.c
+@@ -3,136 +3,150 @@
+ 
+ /**
+  * Unit to read cpu informations
+  *
+  * tpruvot 2014
+  * JayDDee 2019
+  * 
+ */
+ 
+ #include <stdio.h>
+ #include <ctype.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include "miner.h"
+ #include "simd-utils.h"
+ 
+ // hwcap.h missing on MinGW, MacOS
+ #if defined(__aarch64__) && !(defined(WIN32) || defined(__APPLE__)) 
+ #define ARM_AUXV 
+ #endif
+ 
+ #if defined(ARM_AUXV)
+ // for arm's "cpuid"
+ #include <sys/auxv.h>
+ #include <asm/hwcap.h>
+ #include <sys/prctl.h>
+ #endif
+ 
+ #if !(defined(WIN32) || defined(__APPLE__))
+ 
+-// 1035g1: /sys/devices/platform/coretemp.0/hwmon/hwmon3/temp1_input
+-// 1035g1: /sys/class/hwmon/hwmon1/temp1_input wrong temp
+-// ryzen has no /sys/devices/platform/coretemp.0
+-// ryzen: /sys/class/hwmon/hwmon0
+-// 2400: /sys/class/hwmon/hwmon0/temp1_input incorrect temp
+-// 2400 has no /sys/class/hwmon/hwmon2/temp1_input
+-// 2400 /sys/devices/platform/coretemp.0/hwmon/hwmon1/temp1_input ok
+-// 6700 /sys/devices/platform/coretemp.0/hwmon/hwmon2/temp1_input
+-// 6700 /sys/class/hwmon/hwmon2/temp1_input
+-// /sys/devices/platform/coretemp.0/hwmon/hwmon0/temp2_input never exists
+-// /sys/class/hwmon/hwmon0/temp2_input doesn't exist or shows wrong temp (sys16)
+-// /sys/class/hwmon/hwmon0/device/temp1_input doesn't exist
+-
+-
+-// the first 3 will find i5-2400, i7-6700k, r7-1700, i5-1035g1.
+-// The others are left in for legacy, some should probably be removed.
+-#define HWMON_PATH1 \
+-   "/sys/devices/platform/coretemp.0/hwmon/hwmon3/temp1_input"
+-
+-#define HWMON_PATH2 \
+-   "/sys/devices/platform/coretemp.0/hwmon/hwmon1/temp1_input"
+-
+-#define HWMON_PATH3 \
+-   "/sys/devices/platform/coretemp.0/hwmon/hwmon2/temp1_input"
+-
+-#define HWMON_PATH \
+- "/sys/class/hwmon/hwmon2/temp1_input"
+-
+-// need this for Ryzen
+-#define HWMON_ALT \
+- "/sys/class/hwmon/hwmon0/temp1_input"
++#include <errno.h>
++#include <glob.h>
+ 
+-/*
+-#define HWMON_ALT1 \
+- "/sys/devices/platform/coretemp.0/hwmon/hwmon1/temp1_input"
+-*/
+-
+-// This shows wrong temp on i5-1035g1
+-#define HWMON_ALT2 \
+- "/sys/class/hwmon/hwmon1/temp1_input"
+-
+-// None of these work on any of the cpus above.
+-#define HWMON_ALT3 \
+- "/sys/devices/platform/coretemp.0/hwmon/hwmon0/temp2_input"
+-#define HWMON_ALT4 \
+- "/sys/class/hwmon/hwmon0/temp2_input"
+-#define HWMON_ALT5 \
+-"/sys/class/hwmon/hwmon0/device/temp1_input"
++#ifndef CPUMINER_HWMON_ROOT
++#define CPUMINER_HWMON_ROOT "/sys/class/hwmon"
++#endif
+ 
+-static inline float linux_cputemp(int core)
++static bool linux_cpu_sensor_name(const char *name)
+ {
+-	float tc = 0.0;
+-	FILE *fd;
+-	uint32_t val = 0;
+-
+-   fd = fopen(HWMON_PATH1, "r");
+-
+-   if (!fd)
+-      fd = fopen(HWMON_PATH2, "r");
+-
+-   if (!fd)
+-      fd = fopen(HWMON_PATH3, "r");
++	return !strcmp(name, "coretemp") || !strcmp(name, "k10temp") ||
++	       !strcmp(name, "k8temp") || !strcmp(name, "zenpower") ||
++	       !strcmp(name, "cpu_thermal") || !strcmp(name, "x86_pkg_temp");
++}
+ 
+-   if (!fd)
+-      fd = fopen(HWMON_PATH, "r");
++static float linux_cpu_sensor_temperature(const char *path)
++{
++	FILE *fd = fopen(path, "r");
++	char reading[64], *end;
++	long value;
+ 
+-   if (!fd)
+-      fd = fopen(HWMON_ALT, "r");
+-   
+ 	if (!fd)
+-		return tc;
++		return 0.0;
++	if (!fgets(reading, sizeof(reading), fd) ||
++	    (!strchr(reading, '\n') && !feof(fd))) {
++		fclose(fd);
++		return 0.0;
++	}
++	fclose(fd);
++	errno = 0;
++	value = strtol(reading, &end, 10);
++	if (errno || end == reading || value < 0 || value > 150000)
++		return 0.0;
++	while (isspace((unsigned char)*end))
++		end++;
++	if (*end)
++		return 0.0;
++	return value / 1000.0f;
++}
+ 
+-	if ( fscanf( fd, "%d", &val ) )
+-		tc = val / 1000.0;
+-	fclose( fd );
+-	return tc;
++static inline float linux_cputemp(int core)
++{
++	glob_t names = {0};
++	float maximum = 0.0;
++	size_t i;
++	(void)core;
++
++	/* hwmon numbers change across boots. Only recognized CPU devices are
++	 * eligible, so an unrelated NVMe/board sensor cannot satisfy the cutoff.
++	 * Use the hottest package/core reading, not the first available sensor. */
++	if (glob(CPUMINER_HWMON_ROOT "/hwmon*/name", 0, NULL, &names)) {
++		globfree(&names);
++		return 0.0;
++	}
++	for (i = 0; i < names.gl_pathc; i++) {
++		const char *name_path = names.gl_pathv[i];
++		char name[64], *pattern;
++		FILE *fd = fopen(name_path, "r");
++		glob_t inputs = {0};
++		size_t j, prefix_len;
++
++		if (!fd)
++			continue;
++		if (!fgets(name, sizeof(name), fd)) {
++			fclose(fd);
++			continue;
++		}
++		fclose(fd);
++		name[strcspn(name, "\r\n")] = '\0';
++		if (!linux_cpu_sensor_name(name))
++			continue;
++		prefix_len = strlen(name_path) - strlen("name");
++		pattern = (char *)malloc(prefix_len + sizeof("temp*_input"));
++		if (!pattern)
++			continue;
++		memcpy(pattern, name_path, prefix_len);
++		strcpy(pattern + prefix_len, "temp*_input");
++		if (!glob(pattern, 0, NULL, &inputs)) {
++			for (j = 0; j < inputs.gl_pathc; j++) {
++				float reading = linux_cpu_sensor_temperature(inputs.gl_pathv[j]);
++				if (reading > maximum)
++					maximum = reading;
++			}
++		}
++		globfree(&inputs);
++		free(pattern);
++	}
++	globfree(&names);
++	/* Zero keeps the upstream no-sensor convention. The wrapper doctor and
++	 * health checks must report that a thermal cutoff is unavailable. */
++	return maximum;
+ }
+ 
+ 
+ #define CPUFREQ_PATH0\
+  "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+ 
+ #define CPUFREQ_PATHn \
+  "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq"
+ 
+ static inline float linux_cpufreq(int core)
+ {
+ 	FILE *fd = fopen( CPUFREQ_PATH0, "r" );
+ 	long int freq = 0;
+ 
+ 	if ( !fd ) return (float)freq;
+ 	if ( !fscanf( fd, "%ld", &freq ) ) freq = 0;
+    fclose( fd );
+ 	return (float)freq;
+ }
+ 
+ static inline void linux_cpu_hilo_freq( float *lo, float *hi )
+ {
+    long int freq = 0, hi_freq = 0, lo_freq = 0x7fffffff;
+ 
+    for ( int i = 0; i < num_cpus; i++ )
+    {
+       char path[64];
+       sprintf( path, CPUFREQ_PATHn, i );   
+       FILE *fd = fopen( path, "r" );
+       if ( !fd ) return;
+diff --git a/util.c b/util.c
+index 65d673f..bb4f403 100644
+--- a/util.c
++++ b/util.c
+@@ -535,119 +535,146 @@ static int sockopt_keepalive_cb(void *userdata, curl_socket_t fd,
+ 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPCNT,
+ 		&tcp_keepcnt, sizeof(tcp_keepcnt))))
+ 		return 1;
+ 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPIDLE,
+ 		&tcp_keepidle, sizeof(tcp_keepidle))))
+ 		return 1;
+ 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPINTVL,
+ 		&tcp_keepintvl, sizeof(tcp_keepintvl))))
+ 		return 1;
+ #endif /* __linux */
+ #ifdef __APPLE_CC__
+ 	if (unlikely(setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE,
+ 		&tcp_keepintvl, sizeof(tcp_keepintvl))))
+ 		return 1;
+ #endif /* __APPLE_CC__ */
+ #else /* WIN32 */
+ 	struct tcp_keepalive vals;
+ 	vals.onoff = 1;
+ 	vals.keepalivetime = tcp_keepidle * 1000;
+ 	vals.keepaliveinterval = tcp_keepintvl * 1000;
+ 	DWORD outputBytes;
+ 	if (unlikely(WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals),
+ 		NULL, 0, &outputBytes, NULL, NULL)))
+ 		return 1;
+ #endif /* WIN32 */
+ 
+ 	return 0;
+ }
+ #endif
+ 
++/* Abort connection setup if a requested libcurl control is unavailable. */
++#define CURL_SETOPT_OR_GOTO(handle, option, value, label) do { \
++	CURLcode setup_rc = curl_easy_setopt((handle), (option), (value)); \
++	if (setup_rc != CURLE_OK) { \
++		rc = setup_rc; \
++		applog(LOG_ERR, "libcurl option %s failed: %s", \
++		       #option, curl_easy_strerror(setup_rc)); \
++		goto label; \
++	} \
++} while (0)
++
++static CURLcode configure_tls_verification(CURL *curl)
++{
++	CURLcode rc;
++
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_SSL_VERIFYPEER, 1L, out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_SSL_VERIFYHOST, 2L, out);
++	/* Callers use freshly initialized/reset handles. Leave libcurl's
++	 * built-in trust store unchanged unless a custom CA was requested. */
++	if (opt_cert)
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_CAINFO, opt_cert, out);
++	rc = CURLE_OK;
++out:
++	return rc;
++}
++
+ json_t *json_rpc_call(CURL *curl, const char *url,
+ 		      const char *userpass, const char *rpc_req,
+ 		      int *curl_err, int flags)
+ {
+ 	json_t *val, *err_val, *res_val;
+-	int rc;
++	int rc = CURLE_OK;
+ 	long http_rc;
+ 	struct data_buffer all_data = {0};
+ 	char *json_buf;
+ 	json_error_t err;
+ 	struct curl_slist *headers = NULL;
+ 	char curl_err_str[CURL_ERROR_SIZE] = { 0 };
+ 	long timeout = (flags & JSON_RPC_LONGPOLL) ? opt_timeout : 30;
+ 	struct header_info hi = {0};
+ 
+    all_data.headers = &hi;
+ 	/* it is assumed that 'curl' is freshly [re]initialized at this pt */
+ 
+-	if (opt_protocol)  curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
+-	curl_easy_setopt(curl, CURLOPT_URL, url);
+-	if (opt_cert)      curl_easy_setopt(curl, CURLOPT_CAINFO, opt_cert);
+-   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, false);
+-	curl_easy_setopt(curl, CURLOPT_ENCODING, "");
+-	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 0);
+-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+-	curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
+-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, all_data_cb);
+-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &all_data);
+-   curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_err_str);
+-	if (opt_redirect)  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+-	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, resp_hdr_cb);
+-	curl_easy_setopt(curl, CURLOPT_HEADERDATA, &hi);
++	if (opt_protocol)  CURL_SETOPT_OR_GOTO(curl, CURLOPT_VERBOSE, 1L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_URL, url, err_out);
++	rc = configure_tls_verification(curl);
++	if (rc != CURLE_OK)
++		goto err_out;
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_ENCODING, "", err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_FAILONERROR, 0L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_NOSIGNAL, 1L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_TCP_NODELAY, 1L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_WRITEFUNCTION, all_data_cb, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_WRITEDATA, &all_data, err_out);
++   CURL_SETOPT_OR_GOTO(curl, CURLOPT_ERRORBUFFER, curl_err_str, err_out);
++	if (opt_redirect)  CURL_SETOPT_OR_GOTO(curl, CURLOPT_FOLLOWLOCATION, 1L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_TIMEOUT, timeout, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_HEADERFUNCTION, resp_hdr_cb, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_HEADERDATA, &hi, err_out);
+ 	if (opt_proxy)
+    {
+-		curl_easy_setopt(curl, CURLOPT_PROXY, opt_proxy);
+-		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, opt_proxy_type);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_PROXY, opt_proxy, err_out);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_PROXYTYPE, (long)opt_proxy_type, err_out);
+ 	}
+ 	if (userpass)
+    {
+-		curl_easy_setopt(curl, CURLOPT_USERPWD, userpass);
+-		curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_USERPWD, userpass, err_out);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC, err_out);
+ 	}
+ #if LIBCURL_VERSION_NUM >= 0x070f06
+ 	if (flags & JSON_RPC_LONGPOLL)
+-		curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb, err_out);
+ #endif
+-   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, rpc_req);
++   CURL_SETOPT_OR_GOTO(curl, CURLOPT_POSTFIELDS, rpc_req, err_out);
+ 
+ 	if (opt_protocol)
+ 		applog(LOG_DEBUG, "JSON protocol request:\n%s\n", rpc_req);
+ 
+ 	headers = curl_slist_append(headers, "Content-Type: application/json");
+ 	headers = curl_slist_append(headers, "User-Agent: " USER_AGENT);
+ 	headers = curl_slist_append(headers, "X-Mining-Extensions: longpoll reject-reason");
+ 	//headers = curl_slist_append(headers, "Accept:"); // disable Accept hdr
+ 	//headers = curl_slist_append(headers, "Expect:"); // disable Expect hdr
+ 
+-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_HTTPHEADER, headers, err_out);
+ 
+ 	rc = curl_easy_perform(curl);
+ 	if (curl_err != NULL)
+ 		*curl_err = rc;
+ 	if (rc) {
+ 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_rc);
+ 		if (!((flags & JSON_RPC_LONGPOLL) && rc == CURLE_OPERATION_TIMEDOUT) &&
+ 		    !((flags & JSON_RPC_QUIET_404) && http_rc == 404))
+ 			applog(LOG_ERR, "HTTP request failed: %s", curl_err_str);
+ 		if (curl_err && (flags & JSON_RPC_QUIET_404) && http_rc == 404)
+ 			*curl_err = CURLE_OK;
+ 		goto err_out;
+ 	}
+ 
+ // want_stratum is useless, and so is this code it seems. Nothing in
+ // hi appears to be set.   
+ 	/* If X-Stratum was found, activate Stratum */
+ 	if (want_stratum && hi.stratum_url &&
+ 	    !strncasecmp(hi.stratum_url, "stratum+tcp://", 14)) {
+ 		have_stratum = true;
+ 		tq_push(thr_info[stratum_thr_id].q, hi.stratum_url);
+ 		hi.stratum_url = NULL;
+ 	}
+ 
+ 	/* If X-Long-Polling was found, activate long polling */
+ 	if (!have_longpoll && want_longpoll && hi.lp_path && !have_gbt &&
+ 	    allow_getwork && !have_stratum) {
+ 		have_longpoll = true;
+ 		tq_push(thr_info[longpoll_thr_id].q, hi.lp_path);
+ 		hi.lp_path = NULL;
+@@ -693,60 +720,62 @@ json_t *json_rpc_call(CURL *curl, const char *url,
+ 				free(s);
+ 				s = strdup(json_string_value(msg));
+ 				if (have_longpoll && s && !strcmp(s, "method not getwork")) {
+ 					json_decref(err_val);
+ 					free(s);
+ 					goto err_out;
+ 				}
+ 			}
+ 			json_decref(err_val);
+ 		}
+ 		else
+ 			s = strdup("(unknown reason)");
+ 
+ 		if (!curl_err || opt_debug)
+ 			applog(LOG_ERR, "JSON-RPC call failed: %s", s);
+ 
+ 		free(s);
+ 
+ 		goto err_out;
+ 	}
+ 
+ 	if (hi.reason)
+ 		json_object_set_new(val, "reject-reason", json_string(hi.reason));
+ 
+ 	databuf_free(&all_data);
+ 	curl_slist_free_all(headers);
+ 	curl_easy_reset(curl);
+ 	return val;
+ 
+ err_out:
++	if (curl_err && rc != CURLE_OK)
++		*curl_err = rc;
+ 	free(hi.lp_path);
+ 	free(hi.reason);
+ 	free(hi.stratum_url);
+ 	databuf_free(&all_data);
+ 	curl_slist_free_all(headers);
+ 	curl_easy_reset(curl);
+ 	return NULL;
+ }
+ 
+ /* used to load a remote config */
+ json_t* json_load_url(char* cfg_url, json_error_t *err)
+ {
+ 	char err_str[CURL_ERROR_SIZE] = { 0 };
+ 	struct data_buffer all_data = { 0 };
+ 	int rc = 0; json_t *cfg = NULL;
+ 	CURL *curl = curl_easy_init();
+ 	if (unlikely(!curl)) {
+ 		applog(LOG_ERR, "Remote config init failed!");
+ 		return NULL;
+ 	}
+ 	curl_easy_setopt(curl, CURLOPT_URL, cfg_url);
+ 	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
+ 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15);
+ 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, err_str);
+ 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+ 	curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
+ 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, all_data_cb);
+ 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &all_data);
+ 	if (opt_proxy) {
+ 		curl_easy_setopt(curl, CURLOPT_PROXY, opt_proxy);
+@@ -1365,328 +1394,374 @@ inline double nbits_to_diff( uint32_t nbits )
+          diff = (long double)( (uint128_t)0xffff << ( (-shift_off) *8 ) ) 
+               / (long double)bits;
+       else // ( shift_off > 0 )   // shift > 29
+          diff =   (long double)0xffff
+                 / (long double)( (uint128_t)bits << ( shift_off*8 ) );  
+    }
+    else
+    {  // slow
+       int m;
+       diff = 0.;
+       for ( m = shift; m < 29; m++ )    diff *= 256.0;
+       for ( m = 29; m < shift; m++ )    diff /= 256.0;
+    }
+ 
+    if ( opt_debug )
+       applog( LOG_INFO, "nbits %08x: shift %u(%d), bits %06x, diff %8g",
+                          nbits, shift, shift_off, bits, (double)diff );
+ 
+    return (double)diff;
+ }
+ 
+ #ifdef WIN32
+ #define socket_blocks() (WSAGetLastError() == WSAEWOULDBLOCK)
+ #else
+ #define socket_blocks() (errno == EAGAIN || errno == EWOULDBLOCK)
+ #endif
+ 
+ static bool send_line( struct stratum_ctx *sctx, char *s )
+ {
+ 	size_t sent = 0;
+-	int len;
++	size_t len;
+ 
+-	len = (int) strlen(s);
++	len = strlen(s);
+ 	s[len++] = '\n';
+ 
+ 	while ( len > 0 )
+    {
+ 		struct timeval timeout = {0, 0};
++#if LIBCURL_VERSION_NUM >= 0x071802
++		size_t n = 0;
++#else
+ 		int n;
++#endif
+ 		fd_set wd;
+ 
+ // Something nasty going on With Windows on aarch64. This hack prevents
+ // corrupting the sctx pointer. This only works if placed inside the while loop.
+ #if defined(__aarch64__) && defined(WIN32) && defined(ARM_WIN_HACK)
+       printf("");
+ #endif
+ 
+ 		FD_ZERO( &wd );
+ 		FD_SET( sctx->sock, &wd );
+ 		if ( select( (int) ( sctx->sock + 1 ), NULL, &wd, NULL, &timeout ) < 1 )
+ 			return false;
+ 
+ #if LIBCURL_VERSION_NUM >= 0x071802
+ 
+-     CURLcode rc = curl_easy_send(sctx->curl, s + sent, len, (size_t *)&n);
++     CURLcode rc = curl_easy_send(sctx->curl, s + sent, len, &n);
+      if ( rc != CURLE_OK )
+      {
+         if ( rc != CURLE_AGAIN )
+ #else                      
+      n = send( sctx->sock, s + sent, len, 0);
+      if ( n < 0 )
+      {
+      if ( !socket_blocks() )
+ #endif
+         return false;
+ 	     n = 0;
+ 	  }
+      sent += n;
+      len -= n;
+    }
+ 
+ 	return true;
+ }
+ 
+ bool stratum_send_line(struct stratum_ctx *sctx, char *s)
+ {
+ 	bool ret = false;
+ 
+ 	if (opt_protocol)
+ 		applog(LOG_DEBUG, "> %s", s);
+ 
+ 	pthread_mutex_lock(&sctx->sock_lock);
+-	ret = send_line( sctx, s );
++	if (sctx->curl)
++		ret = send_line( sctx, s );
+ 	pthread_mutex_unlock(&sctx->sock_lock);
+ 
+ 	return ret;
+ }
+ 
+ static bool socket_full(curl_socket_t sock, int timeout)
+ {
+ 	struct timeval tv;
+ 	fd_set rd;
+ 
+ 	FD_ZERO(&rd);
+ 	FD_SET(sock, &rd);
+ 	tv.tv_sec = timeout;
+ 	tv.tv_usec = 0;
+ 	if (select((int)(sock + 1), &rd, NULL, NULL, &tv) > 0)
+ 		return true;
+ 	return false;
+ }
+ 
+ bool stratum_socket_full(struct stratum_ctx *sctx, int timeout)
+ {
+-	return strlen(sctx->sockbuf) || socket_full(sctx->sock, timeout);
++	return (sctx->sockbuf && sctx->sockbuf[0]) ||
++	       (sctx->curl && socket_full(sctx->sock, timeout));
+ }
+ 
+ #define RBUFSIZE 2048
+ #define RECVSIZE (RBUFSIZE - 4)
++/* Maximum accumulated wire bytes, excluding the terminating NUL. This
++ * comfortably accommodates normal mining.notify frames while bounding
++ * memory even when a peer never sends a newline. */
++#define STRATUM_MAX_BUFFER (1024U * 1024U)
++#define STRATUM_FRAME_TIMEOUT 60
+ 
+-static void stratum_buffer_append(struct stratum_ctx *sctx, const char *s)
++static bool stratum_buffer_append(struct stratum_ctx *sctx, const char *s,
++                                  size_t len)
+ {
+-	size_t old, n;
++	size_t old, needed, capacity;
++	char *replacement;
+ 
++	if (!sctx->sockbuf || memchr(s, '\0', len))
++		return false;
+ 	old = strlen(sctx->sockbuf);
+-	n = old + strlen(s) + 1;
+-	if (n >= sctx->sockbuf_size) {
+-		sctx->sockbuf_size = n + (RBUFSIZE - (n % RBUFSIZE));
+-		sctx->sockbuf = (char*) realloc(sctx->sockbuf, sctx->sockbuf_size);
++	if (old > STRATUM_MAX_BUFFER || len > STRATUM_MAX_BUFFER - old)
++		return false;
++	needed = old + len + 1;
++	if (needed > sctx->sockbuf_size) {
++		capacity = ((needed + RBUFSIZE - 1) / RBUFSIZE) * RBUFSIZE;
++		if (capacity > STRATUM_MAX_BUFFER + 1)
++			capacity = STRATUM_MAX_BUFFER + 1;
++		replacement = (char *)realloc(sctx->sockbuf, capacity);
++		if (!replacement)
++			return false;
++		sctx->sockbuf = replacement;
++		sctx->sockbuf_size = capacity;
+ 	}
+-	strcpy(sctx->sockbuf + old, s);
++	memcpy(sctx->sockbuf + old, s, len);
++	sctx->sockbuf[old + len] = '\0';
++	return true;
+ }
+ 
+ char *stratum_recv_line(struct stratum_ctx *sctx)
+ {
+-	ssize_t len, buflen;
+-	char *tok, *sret = NULL;
+-
+-	if (!strstr(sctx->sockbuf, "\n")) {
+-		bool ret = true;
+-		time_t rstart;
++	size_t len, buflen;
++	char *newline, *sret;
++	time_t rstart = time(NULL);
+ 
+-		time(&rstart);
+-		if (!socket_full(sctx->sock, 60)) {
+-			applog(LOG_WARNING, "stratum_recv_line timed out");
+-			goto out;
++	if (!sctx->curl || !sctx->sockbuf)
++		return NULL;
++	while (!(newline = strchr(sctx->sockbuf, '\n'))) {
++		char s[RBUFSIZE];
++		size_t n = 0;
++		time_t elapsed = time(NULL) - rstart;
++
++		/* Never parse a partial frame, including after a clock rollback. */
++		if (elapsed < 0 || elapsed >= STRATUM_FRAME_TIMEOUT) {
++			applog(LOG_WARNING, "Stratum frame incomplete after 60 seconds");
++			goto failed;
+ 		}
+-		do {
+-			char s[RBUFSIZE];
+-			ssize_t n;
+-
+-			memset(s, 0, RBUFSIZE);
+-
+ #if LIBCURL_VERSION_NUM >= 0x071802
+-
+-			CURLcode rc = curl_easy_recv(sctx->curl, s, RECVSIZE, (size_t *)&n);
+-			if (rc == CURLE_OK && !n) {
+-				ret = false;
+-				break;
+-			}
+-			if (rc != CURLE_OK) {
+-				if (rc != CURLE_AGAIN || !socket_full(sctx->sock, 1)) {
++		/* libcurl may already have decrypted bytes buffered even when the
++		 * socket is not readable, so attempt recv before waiting. */
++		CURLcode rc = curl_easy_recv(sctx->curl, s, RECVSIZE, &n);
++		if (rc == CURLE_AGAIN) {
++			socket_full(sctx->sock, 1);
++			continue;
++		}
++		if (rc != CURLE_OK || !n) {
++			applog(LOG_WARNING, "Stratum receive failed or peer disconnected");
++			goto failed;
++		}
+ #else
+-
+-         n = recv(sctx->sock, s, RECVSIZE, 0);
+-			if (!n) {
+-				ret = false;
+-				break;
+-			}
+-			if (n < 0) {
+-				if (!socket_blocks() || !socket_full(sctx->sock, 1)) {
++		ssize_t received;
++		if (!socket_full(sctx->sock, 1))
++			continue;
++		received = recv(sctx->sock, s, RECVSIZE, 0);
++		if (received < 0 && socket_blocks())
++			continue;
++		if (received <= 0) {
++			applog(LOG_WARNING, "Stratum receive failed or peer disconnected");
++			goto failed;
++		}
++		n = (size_t)received;
+ #endif
+-               ret = false;
+-					break;
+-				}
+-			} else
+-				stratum_buffer_append(sctx, s);
+-		} while (time(NULL) - rstart < 60 && !strstr(sctx->sockbuf, "\n"));
+-
+-		if (!ret) {
+-			applog(LOG_WARNING, "stratum_recv_line failed");
+-			goto out;
++		if (!stratum_buffer_append(sctx, s, n)) {
++			applog(LOG_WARNING, "Stratum buffer rejected: limit, NUL or allocation failure");
++			goto failed;
+ 		}
+ 	}
+ 
+-	buflen = (ssize_t) strlen(sctx->sockbuf);
+-	tok = strtok(sctx->sockbuf, "\n");
+-	if (!tok) {
+-		applog(LOG_ERR, "stratum_recv_line failed to parse a newline-terminated string");
+-		goto out;
++	len = (size_t)(newline - sctx->sockbuf);
++	sret = (char *)malloc(len + 1);
++	if (!sret) {
++		applog(LOG_ERR, "Stratum frame allocation failed");
++		goto failed;
+ 	}
+-	sret = strdup(tok);
+-	len = (ssize_t) strlen(sret);
+-
+-	if (buflen > len + 1)
+-		memmove(sctx->sockbuf, sctx->sockbuf + len + 1, buflen - len + 1);
+-	else
+-		sctx->sockbuf[0] = '\0';
+-
+-out:
+-	if (sret && opt_protocol)
++	memcpy(sret, sctx->sockbuf, len);
++	sret[len] = '\0';
++	buflen = strlen(sctx->sockbuf);
++	/* Preserve all subsequent frames and their terminating NUL. */
++	memmove(sctx->sockbuf, newline + 1, buflen - len);
++	if (opt_protocol)
+ 		applog(LOG_DEBUG, "< %s", sret);
+ 	return sret;
++
++failed:
++	stratum_disconnect(sctx);
++	return NULL;
+ }
+ 
+ #if LIBCURL_VERSION_NUM >= 0x071101 && LIBCURL_VERSION_NUM < 0x072d00
+ //#if LIBCURL_VERSION_NUM >= 0x071101
+ static curl_socket_t opensocket_grab_cb(void *clientp, curlsocktype purpose,
+ 	struct curl_sockaddr *addr)
+ {
+ 	curl_socket_t *sock = (curl_socket_t*) clientp;
+ 	*sock = socket(addr->family, addr->socktype, addr->protocol);
+ 	return *sock;
+ }
+ #endif
+ 
+ bool stratum_connect(struct stratum_ctx *sctx, const char *url)
+ {
+ 	CURL *curl;
+ 	int rc;
++	const char *scheme, *suffix;
++
++	if (!url)
++		return false;
++	if (!strncasecmp(url, "stratum+ssl://", 14) ||
++	    !strncasecmp(url, "stratum+tcps://", 15))
++		scheme = "https";
++	else if (!strncasecmp(url, "stratum+tcp://", 14))
++		scheme = "http";
++	else {
++		applog(LOG_ERR, "Unsupported Stratum URL scheme");
++		return false;
++	}
+ 
+ 	pthread_mutex_lock(&sctx->sock_lock);
+ 	if (sctx->curl)
+ 		curl_easy_cleanup(sctx->curl);
+ 	sctx->curl = curl_easy_init();
+ 	if (!sctx->curl) {
+ 		applog(LOG_ERR, "CURL initialization failed");
+ 		pthread_mutex_unlock(&sctx->sock_lock);
+ 		return false;
+ 	}
+ 	curl = sctx->curl;
+ 	if (!sctx->sockbuf) {
+ 		sctx->sockbuf = (char*) calloc(RBUFSIZE, 1);
++		if (!sctx->sockbuf) {
++			applog(LOG_ERR, "Stratum buffer allocation failed");
++			curl_easy_cleanup(curl);
++			sctx->curl = NULL;
++			pthread_mutex_unlock(&sctx->sock_lock);
++			return false;
++		}
+ 		sctx->sockbuf_size = RBUFSIZE;
+ 	}
+ 	sctx->sockbuf[0] = '\0';
+ 	pthread_mutex_unlock(&sctx->sock_lock);
+ 	if (url != sctx->url) {
++		char *replacement = strdup(url);
++		if (!replacement)
++			goto err_out;
+ 		free(sctx->url);
+-		sctx->url = strdup(url);
++		sctx->url = replacement;
++		url = sctx->url;
+ 	}
+-
+-   free(sctx->curl_url);
+-	sctx->curl_url = (char*) malloc(strlen(url));
+-
+-   // replace the stratum protocol prefix with http, https for ssl
+-   sprintf( sctx->curl_url, "%s%s",
+-            ( strstr( url, "s://" ) || strstr( url, "ssl://" ) )
+-               ? "https" : "http", strstr( url, "://" ) );
+-
+-
+-
+-//   sprintf( sctx->curl_url, "http%s", strstr( url, "s://" ) 
+-//                              ? strstr( url, "s://" )
+-//                              : strstr (url, "://"  ) );
++	suffix = strstr(url, "://");
++	free(sctx->curl_url);
++	sctx->curl_url = (char*) malloc(strlen(suffix) + strlen(scheme) + 1);
++	if (!sctx->curl_url)
++		goto err_out;
++	/* Match only the scheme, case-insensitively; paths cannot toggle TLS. */
++	sprintf(sctx->curl_url, "%s%s", scheme, suffix);
+ 
+ 	if (opt_protocol)
+-		curl_easy_setopt(curl, CURLOPT_VERBOSE, 1);
+-	curl_easy_setopt(curl, CURLOPT_URL, sctx->curl_url);
+-	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
+-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30);
+-	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, sctx->curl_err_str);
+-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+-	curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
+-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
+-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_VERBOSE, 1L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_URL, sctx->curl_url, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_FRESH_CONNECT, 1L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_CONNECTTIMEOUT, 30L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_ERRORBUFFER, sctx->curl_err_str, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_NOSIGNAL, 1L, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_TCP_NODELAY, 1L, err_out);
++	rc = configure_tls_verification(curl);
++	if (rc != CURLE_OK)
++		goto err_out;
+    if (opt_proxy) {
+-		curl_easy_setopt(curl, CURLOPT_PROXY, opt_proxy);
+-		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, opt_proxy_type);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_PROXY, opt_proxy, err_out);
++		CURL_SETOPT_OR_GOTO(curl, CURLOPT_PROXYTYPE, (long)opt_proxy_type, err_out);
+ 	}
+-	curl_easy_setopt(curl, CURLOPT_HTTPPROXYTUNNEL, 1);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_HTTPPROXYTUNNEL, 1L, err_out);
+ #if LIBCURL_VERSION_NUM >= 0x070f06
+-	curl_easy_setopt(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_SOCKOPTFUNCTION, sockopt_keepalive_cb, err_out);
+ #endif
+ #if LIBCURL_VERSION_NUM >= 0x071101 && LIBCURL_VERSION_NUM < 0x072d00
+ //#if LIBCURL_VERSION_NUM >= 0x071101
+-	curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, opensocket_grab_cb);
+-	curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, &sctx->sock);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_OPENSOCKETFUNCTION, opensocket_grab_cb, err_out);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_OPENSOCKETDATA, &sctx->sock, err_out);
+ #endif
+-	curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
++	CURL_SETOPT_OR_GOTO(curl, CURLOPT_CONNECT_ONLY, 1L, err_out);
+ 
+ 	rc = curl_easy_perform(curl);
+ 	if (rc) {
+ 		applog(LOG_ERR, "Stratum connection failed: %s", sctx->curl_err_str);
+-		curl_easy_cleanup(curl);
+-		sctx->curl = NULL;
+-		return false;
++		goto err_out;
+ 	}
+ 
+ #if LIBCURL_VERSION_NUM >= 0x072d00
+-	curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sctx->sock);
++	rc = curl_easy_getinfo(curl, CURLINFO_ACTIVESOCKET, &sctx->sock);
++	if (rc != CURLE_OK || sctx->sock == CURL_SOCKET_BAD)
++		goto err_out;
+ #elif LIBCURL_VERSION_NUM < 0x071101   
+ //#if LIBCURL_VERSION_NUM < 0x071101
+ 	/* CURLINFO_LASTSOCKET is broken on Win64; only use it as a last resort */
+ 	curl_easy_getinfo(curl, CURLINFO_LASTSOCKET, (long *)&sctx->sock);
+ #endif
+ 
+ 	return true;
++
++err_out:
++	stratum_disconnect(sctx);
++	return false;
+ }
+ 
+ void stratum_disconnect(struct stratum_ctx *sctx)
+ {
+ 	pthread_mutex_lock(&sctx->sock_lock);
+ 	if (sctx->curl) {
+ 		curl_easy_cleanup(sctx->curl);
+ 		sctx->curl = NULL;
+-		sctx->sockbuf[0] = '\0';
+ 	}
++	if (sctx->sockbuf)
++		sctx->sockbuf[0] = '\0';
++	sctx->sock = CURL_SOCKET_BAD;
+ 	pthread_mutex_unlock(&sctx->sock_lock);
+ }
+ 
+ static const char *get_stratum_session_id(json_t *val)
+ {
+ 	json_t *arr_val;
+ 	int i, n;
+ 
+ 	arr_val = json_array_get(val, 0);
+ 	if (!arr_val || !json_is_array(arr_val))
+ 		return NULL;
+ 	n = (int) json_array_size(arr_val);
+ 	for (i = 0; i < n; i++) {
+ 		const char *notify;
+ 		json_t *arr = json_array_get(arr_val, i);
+ 
+ 		if (!arr || !json_is_array(arr))
+ 			break;
+ 		notify = json_string_value(json_array_get(arr, 0));
+ 		if (!notify)
+ 			continue;
+ 		if (!strcasecmp(notify, "mining.notify"))
+ 			return json_string_value(json_array_get(arr, 1));
+ 	}
+ 	return NULL;
+ }
+ 
+ static bool stratum_parse_extranonce(struct stratum_ctx *sctx, json_t *params, int pndx)
+ {
+ 	const char* xnonce1;

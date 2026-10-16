@@ -1,0 +1,86 @@
+name: Security and build checks
+
+on:
+  push:
+    branches: [main, codex/security-hardening]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-and-shell:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Python unit tests (no host changes or mining)
+        run: python3 -m unittest discover -s tests -v
+      - name: Shell syntax and lint
+        run: |
+          bash -n scripts/*.sh
+          shellcheck scripts/*.sh
+      - name: Compile Python modules
+        run: |
+          python3 -m compileall -q solominer
+          python3 -m py_compile scripts/solominer
+
+  fedora-pinned-build:
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    timeout-minutes: 35
+    steps:
+      - name: Install CI build prerequisites
+        run: >-
+          dnf -y install git gcc gcc-c++ make autoconf automake libtool
+          pkgconf-pkg-config libcurl-devel jansson-devel gmp-devel zlib-devel
+          openssl-devel python3 patch systemd util-linux shadow-utils tar gzip findutils diffutils
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Fetch exact approved upstream revision as an unprivileged user
+        shell: bash
+        run: |
+          set -euo pipefail
+          useradd --system --create-home --shell /bin/bash ci-builder
+          install -d -o ci-builder -g ci-builder -m 0700 /tmp/cpuminer-ci
+          runuser -u ci-builder -- git init --quiet /tmp/cpuminer-ci
+          runuser -u ci-builder -- git -C /tmp/cpuminer-ci remote add origin https://github.com/JayDDee/cpuminer-opt.git
+          runuser -u ci-builder -- git -C /tmp/cpuminer-ci fetch --depth=1 origin b34565bfaca5da9ed894a326e3ba0dfe459550a4
+          runuser -u ci-builder -- git -C /tmp/cpuminer-ci checkout --detach FETCH_HEAD
+          test "$(runuser -u ci-builder -- git -C /tmp/cpuminer-ci rev-parse HEAD)" = b34565bfaca5da9ed894a326e3ba0dfe459550a4
+      - name: Test exact upstream patch, protocol bounds, and TLS checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          runuser -u ci-builder -- env CPUMINER_SOURCE=/tmp/cpuminer-ci SANITIZE=1 python3 -m unittest discover -s tests -v
+      - name: Build the patched upstream miner without root
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -o ci-builder -g ci-builder -m 0600 patches/cpuminer-opt-v26.1-security.patch /tmp/cpuminer-ci-security.patch
+          runuser -u ci-builder -- bash -euo pipefail -c '
+            cd /tmp/cpuminer-ci
+            test "$(id -u)" -ne 0
+            git apply --check /tmp/cpuminer-ci-security.patch
+            git apply /tmp/cpuminer-ci-security.patch
+            ./autogen.sh
+            CFLAGS="-O2 -march=native -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE" LDFLAGS="-Wl,-z,relro,-z,now -pie" ./configure --with-curl
+            make -j2
+            test -f cpuminer
+            ./cpuminer --version
+          '
+      - name: Verify systemd unit syntax (no service start)
+        shell: bash
+        run: |
+          set -euo pipefail
+          useradd --system --no-create-home --shell /sbin/nologin solominer
+          install -D -m 0755 scripts/solominer /usr/local/bin/solominer
+          systemd-analyze verify systemd/btc-solo-cpu.service systemd/solominer-health.service systemd/solominer-health.timer
