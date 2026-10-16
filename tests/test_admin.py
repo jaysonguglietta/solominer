@@ -19,6 +19,30 @@ from unittest.mock import patch
 from solominer import admin
 
 
+class IdentitySecurityTests(unittest.TestCase):
+    def test_dedicated_existing_accounts_are_accepted(self):
+        account = SimpleNamespace(pw_uid=991, pw_gid=991, pw_shell='/sbin/nologin')
+        with patch.object(admin.pwd, 'getpwnam', return_value=account), \
+             patch.object(admin.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=991)), \
+             patch.object(admin.os, 'getgrouplist', return_value=[991]):
+            admin.ensure_users()
+
+    def test_login_identity_is_rejected(self):
+        account = SimpleNamespace(pw_uid=991, pw_gid=991, pw_shell='/bin/bash')
+        with patch.object(admin.pwd, 'getpwnam', return_value=account), \
+             patch.object(admin.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=991)):
+            with self.assertRaisesRegex(admin.AdminError, 'non-login'):
+                admin.ensure_users()
+
+    def test_extra_groups_cannot_inherit_socket_or_admin_privileges(self):
+        account = SimpleNamespace(pw_uid=991, pw_gid=991, pw_shell='/usr/sbin/nologin')
+        with patch.object(admin.pwd, 'getpwnam', return_value=account), \
+             patch.object(admin.grp, 'getgrnam', return_value=SimpleNamespace(gr_gid=991)), \
+             patch.object(admin.os, 'getgrouplist', return_value=[991, 10]):
+            with self.assertRaisesRegex(admin.AdminError, 'supplementary groups'):
+                admin.ensure_users()
+
+
 class DirectorySecurityTests(unittest.TestCase):
     def test_reject_relative_administrative_path(self):
         with self.assertRaises(admin.AdminError):

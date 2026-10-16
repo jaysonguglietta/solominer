@@ -253,6 +253,92 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn('overheating', result['issues'])
         self.assertIn('crash_loop', result['issues'])
 
+    def sample_cpu_health(self, now, cpu_ns='1000000000', pid='321', temperature=60, active=True, journal=None):
+        diagnostics = self.healthy_diagnostics()
+        diagnostics['service'].update(CPUUsageNSec=cpu_ns, MainPID=pid,
+                                      ActiveState='active' if active else 'inactive',
+                                      SubState='running' if active else 'dead')
+        diagnostics['temperatures'][0]['celsius'] = temperature
+        with patch.object(runtime, 'report', return_value=diagnostics), \
+             patch.object(runtime.time, 'time', return_value=now), \
+             patch.object(runtime, '_journal', return_value=(journal or [], None)):
+            return runtime.health_check(self.path / 'cpu-state.json', self.config_path)
+
+    def test_cpu_progress_warmup_and_hashing_without_shares(self):
+        first = self.sample_cpu_health(10000)
+        self.assertNotIn('worker_idle', first['issues'])
+        for number in range(1, 5):
+            result = self.sample_cpu_health(10000 + 300 * number, cpu_ns=str(1000000000 + 3000000000 * number))
+            self.assertNotIn('worker_idle', result['issues'])
+        state = json.loads((self.path / 'cpu-state.json').read_text())
+        self.assertEqual(state['last_progress_at'], 11200)
+
+    def test_idle_worker_alerts_once_and_cpu_progress_recovers(self):
+        self.sample_cpu_health(10000)
+        self.sample_cpu_health(10300)
+        self.sample_cpu_health(10600)
+        stalled = self.sample_cpu_health(10900)
+        self.assertIn('worker_idle', stalled['issues'])
+        self.assertEqual(stalled['events'], [{'event': 'alert', 'issue': 'worker_idle', 'message': stalled['issues']['worker_idle']}])
+        unchanged = self.sample_cpu_health(11200)
+        self.assertFalse(unchanged['changed'])
+        recovered = self.sample_cpu_health(11500, cpu_ns='1100000001')
+        self.assertNotIn('worker_idle', recovered['issues'])
+        self.assertIn({'event': 'recovered', 'issue': 'worker_idle', 'message': 'Condition cleared.'}, recovered['events'])
+
+    def test_thermal_pause_resets_idle_grace(self):
+        self.sample_cpu_health(10000)
+        self.sample_cpu_health(10300)
+        hot = self.sample_cpu_health(10600, temperature=80)
+        self.assertIn('overheating', hot['issues'])
+        hot = self.sample_cpu_health(10900, temperature=80)
+        self.assertNotIn('worker_idle', hot['issues'])
+        cooling = self.sample_cpu_health(11200)
+        self.assertNotIn('worker_idle', cooling['issues'])
+        state = json.loads((self.path / 'cpu-state.json').read_text())
+        self.assertEqual(state['last_progress_at'], 10900)
+
+    def test_known_connection_failures_suppress_idle_worker_alert(self):
+        self.sample_cpu_health(10000)
+        self.sample_cpu_health(10300, journal=[(10200, 'Stratum connection failed')])
+        self.sample_cpu_health(10600)
+        result = self.sample_cpu_health(11200)
+        self.assertIn('pool_connection', result['issues'])
+        self.assertNotIn('worker_idle', result['issues'])
+        reconnected = self.sample_cpu_health(11500, journal=[(11400, 'Stratum difficulty set to 0.01')])
+        self.assertNotIn('worker_idle', reconnected['issues'])
+
+    def test_unavailable_accounting_never_reports_idle(self):
+        for counter in (None, '[not set]', '18446744073709551615', '-1'):
+            with self.subTest(counter=counter):
+                self.sample_cpu_health(10000)
+                self.sample_cpu_health(10300)
+                self.sample_cpu_health(10600)
+                result = self.sample_cpu_health(10900, cpu_ns=counter)
+                self.assertNotIn('worker_idle', result['issues'])
+                (self.path / 'cpu-state.json').unlink()
+
+    def test_restart_and_counter_reset_restart_idle_grace(self):
+        for cpu_ns, pid in (('1000000000', '322'), ('0', '321')):
+            with self.subTest(cpu_ns=cpu_ns, pid=pid):
+                self.sample_cpu_health(10000)
+                self.sample_cpu_health(10300)
+                self.sample_cpu_health(10600)
+                result = self.sample_cpu_health(10900, cpu_ns=cpu_ns, pid=pid)
+                self.assertNotIn('worker_idle', result['issues'])
+                state = json.loads((self.path / 'cpu-state.json').read_text())
+                self.assertEqual(state['last_progress_at'], 10900)
+                (self.path / 'cpu-state.json').unlink()
+
+    def test_inactive_service_and_monitor_gap_reset_idle_grace(self):
+        self.sample_cpu_health(10000)
+        self.sample_cpu_health(10300)
+        self.sample_cpu_health(10600)
+        result = self.sample_cpu_health(10900, active=False)
+        self.assertNotIn('worker_idle', result['issues'])
+        resumed = self.sample_cpu_health(14000)
+        self.assertNotIn('worker_idle', resumed['issues'])
+
     def test_pool_failover_handles_upstream_zero_exit(self):
         config = replace(self.config, fallback_pools=('stratum+tcp://backup.example.org:3333',))
         child1 = Mock(returncode=0)

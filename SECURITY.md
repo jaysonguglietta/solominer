@@ -10,6 +10,8 @@ Miner source is an immutable approved commit, not a moving branch. A mandatory v
 
 The runtime sandbox has no added capabilities, read-only code, protected system/home/kernel interfaces, limited address families, and resource ceilings. It reduces impact after compromise; native parser bugs, kernel vulnerabilities, and permissive local overrides still matter. Never run the miner or upstream builds as root.
 
+The three service identities must have non-login shells, dedicated primary groups, and no account-level supplementary groups. This prevents accidental inheritance of administrative or privileged socket access. The health unit explicitly receives read access through the miner and systemd journal groups; it has no network access.
+
 There is no public management API, authentication session, database, tenant model, webhook receiver, or file upload server. Keep upstream remote APIs disabled. Only outbound pool connectivity is required; no inbound firewall port is needed.
 
 ## Network and privacy

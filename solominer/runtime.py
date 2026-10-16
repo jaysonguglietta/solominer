@@ -336,7 +336,7 @@ _REJECT = re.compile(r'(?:rejected|invalid share|unauthorized|authentication fai
 
 def health_check(state_path: Path | str = DEFAULT_STATE, config_path: Path | str = DEFAULT_CONFIG,
                  binary: Path | str = DEFAULT_BINARY) -> dict[str, Any]:
-    """Track process, connection failures, heat and crash loops; silence repeats.
+    """Track process, CPU progress, connections, heat and crash loops; silence repeats.
 
     No accepted-share deadline is used: solo miners can hash successfully for a
     long time without ever submitting a winning share. Alerts stay local to the
@@ -389,12 +389,41 @@ def health_check(state_path: Path | str = DEFAULT_STATE, config_path: Path | str
         issues['pool_connection'] = f'Pool connection errors have persisted for at least {timeout} seconds with no subsequent connection/work message.'
     if rejects >= 5:
         issues['pool_rejections'] = 'Pool repeatedly rejected work or authentication; verify wallet, worker and pool compatibility in the miner journal.'
+    # Compare service CPU accounting rather than accepted shares or log volume.
+    # Hashing even at the minimum 1% CPU quota should use much more than 100 ms
+    # in a five-minute interval. Warm-up and known pauses never count as stalls.
+    def accounting_number(value: Any, upper_bound: int) -> int | None:
+        text = str(value)
+        if not re.fullmatch(r'[0-9]+', text):
+            return None
+        number = int(text)
+        return number if 0 <= number < upper_bound else None
+
+    cpu_ns = accounting_number(service.get('CPUUsageNSec'), 2**64 - 1)
+    pid = accounting_number(service.get('MainPID'), 2**31)
+    old_cpu_ns = accounting_number(previous.get('last_cpu_ns'), 2**64 - 1)
+    old_pid = accounting_number(previous.get('last_pid'), 2**31)
+    progress_at = previous.get('last_progress_at')
+    if not isinstance(progress_at, (int, float)) or not 0 <= progress_at <= now:
+        progress_at = now
+    active_worker = service.get('ActiveState') == 'active' and service.get('SubState') == 'running' and bool(pid)
+    paused = (not active_worker or config is None or 'overheating' in issues
+              or disconnected is not None or 'pool_rejections' in issues)
+    reset_progress = (paused or cpu_ns is None or old_cpu_ns is None or pid != old_pid
+                      or cpu_ns < old_cpu_ns
+                      or now - last_check > max(timeout * 2, 900))
+    if reset_progress or cpu_ns - old_cpu_ns > 100_000_000:
+        progress_at = now
+    elif now - progress_at >= timeout:
+        issues['worker_idle'] = (f'Miner CPU use stayed at or below 100 ms per health check for at least {timeout} seconds; '
+                                 'inspect the miner journal for a stalled worker and restart if needed.')
     old_issues = previous.get('issues', {})
     if not isinstance(old_issues, dict):
         old_issues = {}
     events = ([{'event': 'alert', 'issue': name, 'message': message} for name, message in sorted(issues.items()) if name not in old_issues]
               + [{'event': 'recovered', 'issue': name, 'message': 'Condition cleared.'} for name in sorted(old_issues) if name not in issues])
-    state = {'checked_at': now, 'restarts': restarts, 'disconnected_since': disconnected, 'issues': issues}
+    state = {'checked_at': now, 'restarts': restarts, 'disconnected_since': disconnected, 'issues': issues,
+             'last_cpu_ns': cpu_ns, 'last_pid': pid, 'last_progress_at': progress_at}
     _save_state(state_path, state)
     return {'ok': not issues, 'changed': bool(events), 'events': events, 'issues': issues,
             'checked_at': now, 'service': service.get('ActiveState', 'unknown')}

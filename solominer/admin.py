@@ -157,6 +157,10 @@ def ensure_users():
             raise AdminError(f"Expected dedicated group {user} does not exist.") from error
         if group.gr_gid != account.pw_gid:
             raise AdminError(f"{user} must use its dedicated primary group {user}.")
+        if account.pw_shell not in ("/sbin/nologin", "/usr/sbin/nologin", "/bin/false", "/usr/bin/false"):
+            raise AdminError(f"{user} must be a dedicated non-login service account.")
+        if set(os.getgrouplist(user, account.pw_gid)) != {account.pw_gid}:
+            raise AdminError(f"{user} has unexpected supplementary groups; use a dedicated service identity.")
 
 def patch_digest():
     return hashlib.sha256(read_regular(SOURCE_ROOT / "patches" / PATCH_NAME)).hexdigest()

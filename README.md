@@ -160,7 +160,7 @@ sudo systemctl list-timers solominer-health.timer
 sudo journalctl -u solominer-health.service --since today --no-pager
 ```
 
-The timer checks every five minutes after a two-minute startup delay, with a small randomized delay. Health alerts remain local in journald and emit only on new conditions or recovery. The timer does not email, send webhooks, or restart based on guessed connection health. Configure external monitoring separately for off-host delivery. A low-hashrate CPU worker may submit shares rarely; absent shares alone are not an outage signal. Check the pool dashboard for accepted work and payout attribution.
+The timer checks every five minutes after a two-minute startup delay, with a small randomized delay. Health alerts remain local in journald and emit only on new conditions or recovery. It detects prolonged connection errors, crashes, overheating, sensor loss, and unusually low CPU progress after a grace period. CPU progress is an advisory signal, with known pauses and restarts excluded. The timer does not email, send webhooks, or automatically restart workers. Configure external monitoring separately for off-host delivery. A low-hashrate CPU worker may submit shares rarely; absent shares alone are not an outage signal. Check the pool dashboard for accepted work and payout attribution.
 
 ```bash
 sudo systemctl stop btc-solo-cpu.service
