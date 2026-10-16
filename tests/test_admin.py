@@ -174,7 +174,39 @@ class BackupIntegrityTests(unittest.TestCase):
             admin.snapshot()
 
 
+class LockTests(unittest.TestCase):
+    def test_concurrent_operation_is_rejected_and_lock_releases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / 'update.lock'
+            actual_open, actual_fstat = os.open, os.fstat
+            def fixture_open(path, flags, mode=0o777):
+                self.assertEqual(str(path), '/run/solominer-admin/update.lock')
+                return actual_open(lock, flags, mode)
+            def root_owned(fd):
+                info = actual_fstat(fd)
+                return SimpleNamespace(st_mode=info.st_mode, st_uid=0)
+            with patch.object(admin, 'secure_dir') as secure, \
+                    patch.object(admin.os, 'open', side_effect=fixture_open), \
+                    patch.object(admin.os, 'fstat', side_effect=root_owned):
+                with admin.update_lock():
+                    with self.assertRaisesRegex(admin.AdminError, 'in progress'):
+                        with admin.update_lock():
+                            self.fail('A second administrative operation acquired the lock.')
+                with admin.update_lock():
+                    pass
+            secure.assert_called_with(Path('/run/solominer-admin'), 0o700)
+
+
 class BuildBoundaryTests(unittest.TestCase):
+    def test_interrupted_builder_is_stopped_before_workspace_cleanup(self):
+        failure = KeyboardInterrupt()
+        with patch.object(admin, 'command', side_effect=[failure, SimpleNamespace(returncode=0)]) as command:
+            with self.assertRaises(KeyboardInterrupt):
+                admin.run_builder(['/bin/false'], Path('/var/lib/solominer-build/fixture'), timeout=1)
+        start = command.call_args_list[0].args[0]
+        unit = next(argument.removeprefix('--unit=') for argument in start if argument.startswith('--unit='))
+        self.assertEqual(command.call_args_list[1].args[0], ['systemctl', 'stop', unit])
+
     def test_sandbox_has_separate_uid_no_network_and_bounded_resources(self):
         workspace = Path('/var/lib/solominer-build/private-fixture')
         command = admin.builder_command(['/bin/bash', str(workspace / 'driver.sh')], workspace)

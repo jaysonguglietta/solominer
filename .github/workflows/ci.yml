@@ -39,7 +39,7 @@ jobs:
     steps:
       - name: Install CI build prerequisites
         run: >-
-          dnf -y install git gcc gcc-c++ make autoconf automake libtool
+          dnf -y install git gcc gcc-c++ libasan libubsan make autoconf automake libtool
           pkgconf-pkg-config libcurl-devel jansson-devel gmp-devel zlib-devel
           openssl-devel python3 patch systemd util-linux shadow-utils tar gzip findutils diffutils
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
