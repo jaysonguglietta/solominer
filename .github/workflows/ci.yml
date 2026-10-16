@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Python unit tests (no host changes or mining)
@@ -44,7 +44,7 @@ jobs:
           dnf -y install git gcc gcc-c++ libasan libubsan make autoconf automake libtool
           pkgconf-pkg-config libcurl-devel jansson-devel gmp-devel zlib-devel
           openssl-devel python3 patch systemd util-linux shadow-utils tar gzip findutils diffutils
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - name: Fetch exact approved upstream revision as an unprivileged user
