@@ -152,6 +152,38 @@ class BackupIntegrityTests(unittest.TestCase):
         self.assertEqual(self.targets['binary'].read_bytes(), b'current miner')
         self.assertEqual(self.targets['cli'].read_bytes(), b'current wrapper')
 
+    def test_bad_destination_is_rejected_before_any_target_changes(self):
+        backup_id = admin.snapshot()
+        self.targets['binary'].write_bytes(b'current miner')
+        self.targets['cli'].unlink()
+        self.targets['cli'].symlink_to(self.targets['binary'])
+        with self.assertRaises(admin.AdminError):
+            admin.restore(backup_id)
+        self.assertEqual(self.targets['binary'].read_bytes(), b'current miner')
+        self.assertTrue(self.targets['cli'].is_symlink())
+
+    def test_corrupt_backup_does_not_stop_running_units(self):
+        backup_id = admin.snapshot()
+        backup = self.root / 'admin/backups' / backup_id
+        (backup / 'binary').write_bytes(b'tampered')
+        with patch.object(admin, 'stop_units') as stop, patch.object(admin, 'command') as command:
+            with self.assertRaises(admin.AdminError):
+                admin.restore_backup(backup_id)
+        stop.assert_not_called()
+        command.assert_not_called()
+
+    def test_invalid_service_state_is_rejected_before_any_target_changes(self):
+        backup_id = admin.snapshot()
+        path = self.root / 'admin/backups' / backup_id / 'states.json'
+        for invalid in ({admin.SERVICE: 'enabled'},
+                        {admin.SERVICE: {'active': 'yes', 'enabled': False}},
+                        {'unknown.service': {'active': True, 'enabled': True}}):
+            with self.subTest(states=invalid):
+                path.write_text(json.dumps(invalid))
+                with self.assertRaises(admin.AdminError):
+                    admin.restore(backup_id)
+                self.assertEqual(self.targets['binary'].read_bytes(), b'original miner')
+
     def test_unexpected_manifest_entry_is_rejected(self):
         backup_id = admin.snapshot()
         path = self.root / 'admin/backups' / backup_id / 'manifest.json'

@@ -240,10 +240,10 @@ def report(config_path: Path | str = DEFAULT_CONFIG, binary: Path | str = DEFAUL
         result['configuration'] = asdict(config)
         result['configuration']['wallet'] = config.wallet[:6] + '…' + config.wallet[-6:]
         checks.append({'name': 'configuration', 'ok': True, 'severity': 'error', 'message': 'Configuration values are valid.'})
-        plaintext = any(pool.startswith('stratum+tcp:') for pool in (config.pool, *config.fallback_pools))
+        plaintext = any(pool.lower().startswith('stratum+tcp:') for pool in (config.pool, *config.fallback_pools))
         checks.append({'name': 'pool_transport', 'ok': not plaintext, 'severity': 'warning',
-                       'message': 'Plaintext Stratum exposes pool traffic to network interception; use verified TLS if your pool supports it.'
-                       if plaintext else 'Stratum uses certificate-verified TLS in the managed patched build.'})
+                       'message': 'A primary or fallback pool uses plaintext Stratum; use verified TLS if your provider supports it.'
+                       if plaintext else 'All configured pools use certificate-verified TLS in the managed patched build.'})
         checks.append({'name': 'pool_redirects', 'ok': config.no_redirect, 'severity': 'warning',
                        'message': 'Pool redirect requests are blocked.' if config.no_redirect else 'Pool redirect requests are enabled; a server can change the destination.'})
         effective = result['service']
@@ -261,7 +261,7 @@ def report(config_path: Path | str = DEFAULT_CONFIG, binary: Path | str = DEFAUL
                             and abs(quota_percent - float(config.cpu_quota[:-1])) < 0.01)
             checks.append({'name': 'resource_limits', 'ok': limits_match, 'severity': 'warning',
                            'message': 'Active systemd resource limits match configuration.' if limits_match else
-                           'Active systemd limits differ from configuration; run sudo solominer apply-config to regenerate the managed drop-in and restart.'})
+                           'Active systemd limits differ from configuration; run sudo /usr/local/bin/solominer apply-config to regenerate the managed drop-in and restart.'})
 
     except ConfigError as exc:
         checks.append({'name': 'configuration', 'ok': False, 'severity': 'error', 'message': str(exc)})

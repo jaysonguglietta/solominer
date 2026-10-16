@@ -60,6 +60,8 @@ def main(argv=None):
                 config = result.get("configuration", {})
                 if config:
                     print(f"Pool: {config.get('pool')}  Worker: {config.get('worker')}  Threads: {config.get('threads')}")
+                    if config.get("fallback_pools"):
+                        print("Configured fallbacks: " + ", ".join(config["fallback_pools"]))
                     print(f"CPU budget: {config.get('cpu_quota')}  Memory ceiling: {config.get('memory_max')}  Temperature limit: {config.get('max_temp')}C")
                 print(f"Current memory: {service.get('MemoryCurrent', 'unknown')} bytes  Tasks: {service.get('TasksCurrent', 'unknown')}")
                 print(f"Miner: {result.get('version', 'unknown')}")

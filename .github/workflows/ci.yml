@@ -27,6 +27,8 @@ jobs:
         run: |
           bash -n scripts/*.sh
           shellcheck scripts/*.sh
+      - name: Actual systemd isolation and recovery (harmless fixture only)
+        run: sudo env CI=true python3 tests/systemd_integration.py
       - name: Compile Python modules
         run: |
           python3 -m compileall -q solominer

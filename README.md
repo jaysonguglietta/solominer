@@ -11,10 +11,10 @@ CPU mining has extremely low odds of finding a Bitcoin block. This setup is for 
 - Builds without root in a systemd sandbox. Installed code and release metadata are owned by root.
 - CPU, memory, task, and temperature limits; validated configuration; readable logs; disabled pool redirects by default.
 - Local status, configuration/permission diagnostics, health checks, serialized updates, staging, and rollback.
-- Atomic activation, startup verification, and recovery of the previous release after failed activation.
+- Atomic file replacement, startup verification, and recovery of the previous release after failed activation.
 - A systemd health timer that reports meaningful failures locally through journald.
 
-There is no web dashboard, listening management API, external notification service, automatic pool change, or automatic Fedora upgrade. Pool failover occurs only when explicitly configured.
+There is no web dashboard, listening management API, external notification service, unconfigured pool change, or automatic Fedora upgrade. Pool failover occurs only when explicitly configured.
 
 ## Requirements
 
@@ -31,8 +31,8 @@ cd /path/to/solominer
 git switch main
 git pull --ff-only
 sudo bash scripts/install-solominer.sh --migrate
-sudo solominer doctor
-sudo solominer status
+sudo /usr/local/bin/solominer doctor
+sudo /usr/local/bin/solominer status
 ```
 
 Save local edits before pulling; `--ff-only` stops on divergent history. Review incoming changes before running an installer with `sudo`.
@@ -60,8 +60,8 @@ On first run the installer creates `/etc/sysconfig/btc-solo-cpu` from the exampl
 ```bash
 sudoedit /etc/sysconfig/btc-solo-cpu
 sudo bash scripts/install-solominer.sh
-sudo solominer doctor
-sudo solominer status
+sudo /usr/local/bin/solominer doctor
+sudo /usr/local/bin/solominer status
 ```
 
 The final install enables the miner and health timer. Read the pool transport note before leaving it running.
@@ -91,8 +91,8 @@ Edit the root-owned `/etc/sysconfig/btc-solo-cpu`. Use one `NAME=value` assignme
 After changing configuration, validate and apply resource limits:
 
 ```bash
-sudo solominer doctor
-sudo solominer apply-config
+sudo /usr/local/bin/solominer doctor
+sudo /usr/local/bin/solominer apply-config
 ```
 
 Mining arguments always use SHA256d, `--no-color`, fixed conventional pool password `x`, and no management API. `apply-config` validates and applies both miner arguments and CPU/memory/task ceilings without rebuilding.
@@ -108,13 +108,13 @@ If your pool documents a TLS endpoint, configure that exact host/port and set `A
 ## Local commands
 
 ```bash
-sudo solominer status
-sudo solominer doctor
-sudo solominer health
-sudo solominer apply-config
-sudo solominer update --check
-sudo solominer update
-sudo solominer rollback
+sudo /usr/local/bin/solominer status
+sudo /usr/local/bin/solominer doctor
+sudo /usr/local/bin/solominer health
+sudo /usr/local/bin/solominer apply-config
+sudo /usr/local/bin/solominer update --check
+sudo /usr/local/bin/solominer update
+sudo /usr/local/bin/solominer rollback
 ```
 
 Use `solominer --help` and `solominer COMMAND --help` for the installed interface.
@@ -142,8 +142,8 @@ cd /path/to/solominer
 git switch main
 git pull --ff-only
 sudo bash scripts/install-solominer.sh
-sudo solominer doctor
-sudo solominer status
+sudo /usr/local/bin/solominer doctor
+sudo /usr/local/bin/solominer status
 ```
 
 `sudo bash scripts/update-solominer.sh` uses the same update flow. Use `--no-restart` to stage, `--activate-staged` to activate that staged build, and `--check` to inspect. `--install-deps` explicitly installs prerequisites; `--update-packages` explicitly requests a Fedora package upgrade. Neither happens by default. Previous shell environment overrides such as `SOURCE_REPO`, `UPDATE_PACKAGES`, and `RESTART_SERVICE` are unsupported; use explicit command options.
@@ -176,7 +176,10 @@ sudo systemctl disable --now btc-solo-cpu.service solominer-health.timer
 - `/etc/sysconfig/btc-solo-cpu`: root-owned configuration.
 - `/etc/systemd/system/btc-solo-cpu.service`: miner sandbox and resource-limit drop-in.
 - `/etc/systemd/system/solominer-health.service` and `.timer`: local health checks.
-- `/opt/cpuminer-opt`: root-owned active binary, retained releases, and provenance.
+- `/opt/cpuminer-opt`: root-owned active binary and provenance.
+- `/var/lib/solominer-admin`: root-owned backup manifests, previous files, and staged builds.
+- `/var/lib/solominer-build`: temporary private build workspaces.
+- `/var/lib/solominer-health`: local health state; `/run/solominer-admin`: maintenance lock.
 
 Build code has no root credentials and cannot write the installed executable tree. Promotion only accepts the expected regular executable. The private build workspace is cleaned after success or failure. The runtime account cannot replace executable or management code. Read [SECURITY.md](SECURITY.md) for residual risks and reporting guidance.
 
@@ -184,7 +187,7 @@ Keep SELinux enabled. The installer does not loosen SELinux policy or open firew
 
 ## Troubleshooting
 
-**Configuration rejected:** run `sudo solominer doctor`, fix the named assignment, and rerun installation. Use a real receive address; invalid checksums/placeholders intentionally fail. Never put shell commands or private wallet material in the file.
+**Configuration rejected:** run `sudo /usr/local/bin/solominer doctor`, fix the named assignment, and rerun installation. Use a real receive address; invalid checksums/placeholders intentionally fail. Never put shell commands or private wallet material in the file.
 
 **Build fails:** the active release remains available. Inspect the error, disk space, network, and Fedora prerequisites; retry after fixing the cause. Do not run upstream build scripts with `sudo` as a workaround.
 
@@ -194,7 +197,7 @@ Keep SELinux enabled. The installer does not loosen SELinux policy or open firew
 
 **Sensor missing:** inspect `sensors` and `/sys/class/hwmon`. `MAX_TEMP` works only if the miner can read a relevant CPU sensor. Diagnose hardware/kernel support before relying on it. CPU quotas are independent containment, not a thermal guarantee.
 
-**Too hot or unresponsive:** stop the service, reduce `THREADS`/`CPU_QUOTA`, address cooling, and reinstall. Choose a hardware-appropriate temperature threshold.
+**Too hot or unresponsive:** stop the service, reduce `THREADS`/`CPU_QUOTA`, address cooling, and run `sudo /usr/local/bin/solominer apply-config`. Choose a hardware-appropriate temperature threshold.
 
 **Unexpected behavior:** inspect `sudo systemctl cat btc-solo-cpu.service` and `sudo systemd-analyze security btc-solo-cpu.service`. Effective local settings matter more than repository defaults.
 
@@ -207,6 +210,6 @@ python3 -m unittest discover -s tests -v
 bash -n scripts/install-solominer.sh scripts/update-solominer.sh
 ```
 
-CI runs Python tests and shell linting on Ubuntu, plus a full pinned/patched upstream build as an unprivileged account and systemd unit verification in Fedora. It does not mine or install onto a live host.
+CI runs Python tests and shell linting on Ubuntu, plus a full pinned/patched upstream build as an unprivileged account and systemd unit verification in Fedora. A disposable Ubuntu VM also executes the actual systemd build sandbox, activation, configuration, staging, rollback, and health units using a harmless compiled fixture. The fixture never mines or contacts a pool; the test refuses any preexisting SoloMiner installation and cleans up its own files/accounts. It does not access your running host.
 
 Before a new deployment, use a disposable Fedora VM to verify install/update/rollback, account write denial, sensor behavior, resource budgets, SELinux AVCs, and controlled TLS failure scenarios. These tests do not establish the safety of all native third-party code or every Fedora/hardware combination.

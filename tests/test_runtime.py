@@ -158,6 +158,18 @@ class RuntimeTests(unittest.TestCase):
         code, output = runtime._command(['/no-such-solominer-tool'])
         self.assertEqual(code, 127)
 
+    def test_tls_primary_does_not_hide_plaintext_fallback_warning(self):
+        self.config_path.write_text(f'POOL=stratum+ssl://secure.example.org:443\nWALLET={WALLET}\n'
+                                    'WORKER=fedora1\nTHREADS=1\nFALLBACK_POOLS=STRATUM+TCP://backup.example.org:3333\n')
+        with patch.object(runtime, 'service_state', return_value={'error': 'fixture'}), \
+             patch.object(runtime, 'temperatures', return_value=[]), \
+             patch.object(runtime, 'immutable_config', return_value=(True, 'ok')), \
+             patch.object(runtime, 'immutable_binary', return_value=(False, 'fixture')):
+            result = runtime.report(self.config_path)
+        transport = next(check for check in result['checks'] if check['name'] == 'pool_transport')
+        self.assertFalse(transport['ok'])
+        self.assertIn('fallback', transport['message'])
+
     def test_untrusted_binary_never_executes(self):
         with patch.object(runtime, 'immutable_config', return_value=(True, 'ok')), \
              patch.object(runtime, 'immutable_binary', return_value=(False, 'unsafe binary')), \

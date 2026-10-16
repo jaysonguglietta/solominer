@@ -22,7 +22,7 @@ Receiving addresses and worker names appear in process arguments and logs. They 
 
 ## Updates and recovery
 
-Updates use a lock, private build workspace, bounded commands, root-owned release storage, binary digests, and provenance metadata. Failed builds leave the active release intact. Activation is atomic and failed startup checks attempt to restore the prior release. After an interruption or power loss, an administrator should inspect state and logs.
+Updates use a lock, private build workspace, bounded commands, root-owned release storage, binary digests, and provenance metadata. Failed builds leave the active release intact. Files are replaced atomically while the service is stopped; failed startup checks attempt to restore the prior release. The complete multi-file activation is not a power-loss transaction. After an interruption or power loss, an administrator should inspect state and logs.
 
 Startup verification checks local service execution. It cannot prove honest pool behavior, successful payouts, or future availability. Journal-based health signals and sensor data have operational limits. Health checks do not automatically restart based on a guessed connection problem.
 
@@ -32,7 +32,7 @@ Continue normal Fedora security updates. Package upgrades are explicitly request
 
 ## Validation expectations
 
-CI exercises configuration, command construction, maintenance invariants, shell linting, unit syntax, upstream patch application/buffer limits, and an unprivileged Fedora build without mining. Local fixture tests do not operate a real service.
+CI exercises configuration, command construction, maintenance invariants, shell linting, unit syntax, upstream patch application/buffer limits, and an unprivileged Fedora build without mining. Local unit tests do not operate a real service. A separate CI-only integration script uses a harmless compiled fixture on a disposable Ubuntu systemd VM to verify actual sandboxing, activation, staging, rollback, and health units. It refuses preexisting installations and requires explicit CI/root/Linux conditions; it performs no mining or pool connection.
 
 Validate on a disposable Fedora host before relying on unattended operation:
 

@@ -377,7 +377,7 @@ def activate(data, metadata, config):
         raise
     atomic_write(ADMIN_DIR / "last-backup", backup_id.encode(), 0o600)
     print(f"Installed patched {UPSTREAM_VERSION} ({UPSTREAM_REVISION[:12]}).")
-    print("Startup was stable. Run sudo solominer doctor for pool and sensor checks.")
+    print("Startup was stable. Run sudo /usr/local/bin/solominer doctor for pool and sensor checks.")
 
 def prepare_config(migrate=False):
     if not DEFAULT_CONFIG.exists():
