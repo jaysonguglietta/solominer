@@ -29,7 +29,7 @@ USERS = ('solominer', 'solominer-build', 'solominer-health')
 HEALTH_SERVICE = 'solominer-health.service'
 TREES = (admin.INSTALL_DIR, admin.ADMIN_DIR, admin.BUILDER_ROOT,
          admin.LIB_ROOT.parent, Path('/var/lib/solominer-health'),
-         admin.RESOURCE_PATH.parent, Path('/run/solominer-admin'))
+         admin.RESOURCE_PATH.parent, Path('/run/solominer-admin'), Path('/run/solominer'))
 FILES = (admin.CLI_PATH, admin.DEFAULT_CONFIG,
          admin.DEFAULT_CONFIG.with_name(admin.DEFAULT_CONFIG.name + '.pre-hardening'),
          admin.UNIT_DIR / admin.SERVICE, admin.UNIT_DIR / HEALTH_SERVICE,
@@ -232,6 +232,21 @@ def exercise():
     expect(admin.is_active(admin.SERVICE), 'Fixture service did not activate.')
     expect(runtime.installation()['verified'], 'Installed fixture digest does not verify.')
     expect(runtime.immutable_binary()[0], 'Installed binary path is writable or not root-owned.')
+    runtime_account = pwd.getpwnam('solominer')
+    runtime_dir = Path('/run/solominer')
+    directory_info = runtime_dir.stat()
+    expect((directory_info.st_uid, directory_info.st_gid, stat.S_IMODE(directory_info.st_mode))
+           == (runtime_account.pw_uid, runtime_account.pw_gid, 0o750),
+           'Runtime state directory has incorrect owner or mode.')
+    state_file = runtime_dir / 'state.json'
+    state_info = state_file.stat()
+    expect((state_info.st_uid, state_info.st_gid, stat.S_IMODE(state_info.st_mode))
+           == (runtime_account.pw_uid, runtime_account.pw_gid, 0o640),
+           'Miner state file is not private to the miner and health group.')
+    expect(systemctl('show', admin.SERVICE, '--property=MemorySwapMax', '--value').stdout.strip() == '0',
+           'Miner swap usage is not disabled.')
+    health_groups = systemctl('show', HEALTH_SERVICE, '--property=SupplementaryGroups', '--value').stdout.split()
+    expect(health_groups == ['solominer'], 'Health service received unexpected supplementary groups.')
     pid = systemctl('show', admin.SERVICE, '--property=MainPID', '--value').stdout.strip()
     uid_line = next(line for line in Path('/proc/' + pid + '/status').read_text().splitlines() if line.startswith('Uid:'))
     expect(int(uid_line.split()[1]) == pwd.getpwnam('solominer').pw_uid, 'Runtime did not use the dedicated account.')

@@ -1,8 +1,10 @@
 """Command-line interface shared by repository scripts and installed service."""
 import argparse
+from datetime import datetime, timezone
 import json
 import sys
 import subprocess
+import time
 from pathlib import Path
 from . import __version__, admin, runtime
 from .config import DEFAULT_CONFIG
@@ -27,7 +29,9 @@ def parser():
         if name == "install":
             sub.add_argument("--migrate", action="store_true", help="Require and preserve existing configuration")
     subs.add_parser("rollback", help="Restore the previous executable, control plane, and unit")
-    subs.add_parser("apply-config", help="Validate and apply settings without rebuilding the miner")
+    apply = subs.add_parser("apply-config", help="Validate and apply settings without rebuilding the miner")
+    apply.add_argument("--from", dest="candidate", type=Path,
+                       help="Apply an absolute candidate path transactionally")
     return result
 
 def main(argv=None):
@@ -41,7 +45,7 @@ def main(argv=None):
         elif args.command == "rollback":
             admin.rollback()
         elif args.command == "apply-config":
-            admin.apply_config()
+            admin.apply_config(args.candidate)
         elif args.command == "run":
             runtime.run_miner(config_path=args.config)
         elif args.command == "health":
@@ -63,6 +67,16 @@ def main(argv=None):
                     if config.get("fallback_pools"):
                         print("Configured fallbacks: " + ", ".join(config["fallback_pools"]))
                     print(f"CPU budget: {config.get('cpu_quota')}  Memory ceiling: {config.get('memory_max')}  Temperature limit: {config.get('max_temp')}C")
+                mining = result.get("mining", {})
+                if mining.get("active_pool"):
+                    print(f"Active pool: {mining['active_pool']}  Miner PID: {mining.get('pid', 'unknown')}")
+                    last_job = mining.get("last_job_at")
+                    when = (f"{datetime.fromtimestamp(last_job, timezone.utc).isoformat()} "
+                            f"({max(0, int(time.time() - last_job))}s ago)"
+                            if isinstance(last_job, (int, float)) and 0 <= last_job <= time.time() + 5 else 'waiting')
+                    print(f"Last validated job: {when}  Failures: {mining.get('failures', 0)}")
+                    if mining.get("last_failure"):
+                        print(f"Last failure: {mining['last_failure']}")
                 print(f"Current memory: {service.get('MemoryCurrent', 'unknown')} bytes  Tasks: {service.get('TasksCurrent', 'unknown')}")
                 print(f"Miner: {result.get('version', 'unknown')}")
                 readings = result.get("temperatures", [])

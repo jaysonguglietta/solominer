@@ -11,6 +11,8 @@ User=solominer
 Group=solominer
 WorkingDirectory=/opt/cpuminer-opt
 ExecStart=/usr/local/bin/solominer run
+RuntimeDirectory=solominer
+RuntimeDirectoryMode=0750
 Restart=always
 RestartSec=30
 TimeoutStopSec=20
@@ -22,6 +24,7 @@ TasksAccounting=true
 # The installer writes validated per-host settings to a managed drop-in.
 CPUQuota=100%
 MemoryMax=256M
+MemorySwapMax=0
 TasksMax=64
 LimitCORE=0
 NoNewPrivileges=true

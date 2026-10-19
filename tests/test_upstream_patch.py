@@ -40,7 +40,11 @@ SOURCE = patched_fragments()
 
 
 def function(name: str) -> str:
-    match = re.search(r"(?m)^(?:static )?(?:inline )?(?:CURLcode|bool|float|char \*|void) ?" + name + r"\(", SOURCE)
+    # Match definitions, not forward declarations in a wider diff hunk.
+    match = re.search(
+        r"(?m)^(?:static )?(?:inline )?(?:CURLcode|bool|float|uint32_t|char \*|void) ?"
+        + name + r"\([^;]*?\)\s*\{", SOURCE
+    )
     if not match:
         raise AssertionError(f"Complete patched function missing: {name}")
     end = SOURCE.index("\n}\n", match.start()) + 3
@@ -394,6 +398,350 @@ int main(int argc, char **argv) {
 """
 
 
+# Keep the exact allocation-and-activation prefix of the native work function.
+# The later statistics/log formatting is unrelated to whether a job became
+# usable work and would require a large set of unrelated miner globals.
+WORK_ACTIVATION_PREFIX = function("stratum_gen_work").split(
+    "pthread_mutex_lock( &stats_lock );", 1
+)[0] + "}\n"
+
+
+JOB_HARNESS = HEADERS + r"""
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <signal.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#define LOG_INFO 4
+#define ALGO_LBRY 1
+#define ALGO_PHI2 2
+#define ALGO_X16RT_VEIL 3
+typedef unsigned char uchar;
+typedef long long json_int_t;
+enum json_kind { J_STRING, J_ARRAY, J_INTEGER, J_BOOLEAN };
+typedef struct json_t {
+    enum json_kind kind;
+    const char *string;
+    json_int_t integer;
+    struct json_t **items;
+    size_t count;
+} json_t;
+static json_t *json_array_get(json_t *array, size_t index) {
+    return array && array->kind == J_ARRAY && index < array->count ? array->items[index] : NULL;
+}
+static size_t json_array_size(json_t *array) {
+    return array && array->kind == J_ARRAY ? array->count : 0;
+}
+static bool json_is_array(json_t *value) { return value && value->kind == J_ARRAY; }
+static bool json_is_boolean(json_t *value) { return value && value->kind == J_BOOLEAN; }
+static bool json_is_integer(json_t *value) { return value && value->kind == J_INTEGER; }
+static bool json_is_true(json_t *value) { return json_is_boolean(value) && value->integer; }
+static json_int_t json_integer_value(json_t *value) { return json_is_integer(value) ? value->integer : 0; }
+static const char *json_string_value(json_t *value) {
+    return value && value->kind == J_STRING ? value->string : NULL;
+}
+static bool hex2bin(uchar *p, const char *s, size_t bytes) {
+    if (!s || strlen(s) != bytes * 2) return false;
+    for (size_t i = 0; i < bytes; i++) {
+        char a = s[i*2], b = s[i*2+1];
+        int hi = a <= '9' ? a - '0' : (tolower((unsigned char)a) - 'a' + 10);
+        int lo = b <= '9' ? b - '0' : (tolower((unsigned char)b) - 'a' + 10);
+        if (hi < 0 || hi > 15 || lo < 0 || lo > 15) return false;
+        p[i] = (uchar)(hi * 16 + lo);
+    }
+    return true;
+}
+struct stratum_job {
+    uchar prevhash[32], final_sapling_hash[32];
+    char *job_id;
+    size_t coinbase_size;
+    uchar *coinbase, *xnonce2;
+    size_t xnonce2_size;
+    int merkle_count, merkle_buf_size;
+    uchar **merkle;
+    uchar version[4], nbits[4], ntime[4];
+    double diff;
+    bool clean;
+    uchar extra[64], denom10[32], denom100[32], denom1000[32], denom10000[32], proofoffullnode[32];
+};
+struct stratum_ctx {
+    pthread_mutex_t work_lock;
+    size_t xnonce1_size, xnonce2_size;
+    uchar *xnonce1;
+    struct stratum_job job;
+    double next_diff;
+    int block_height;
+    bool new_job;
+};
+static int opt_algo;
+static bool opt_sapling, opt_quiet;
+static int allocation_count, fail_at;
+static void *live_allocations[4096];
+static size_t live_count;
+static void *track(void *p) {
+    if (p) {
+        assert(live_count < 4096);
+        live_allocations[live_count++] = p;
+    }
+    return p;
+}
+static void *job_malloc(size_t n) {
+    allocation_count++;
+    if (allocation_count == fail_at) return NULL;
+    return track(malloc(n));
+}
+static void *job_calloc(size_t n, size_t size) {
+    allocation_count++;
+    if (allocation_count == fail_at) return NULL;
+    return track(calloc(n, size));
+}
+static char *job_strdup(const char *s) {
+    allocation_count++;
+    if (allocation_count == fail_at) return NULL;
+    return track(strdup(s));
+}
+static void *job_realloc(void *p, size_t n) {
+    allocation_count++;
+    if (allocation_count == fail_at) return NULL;
+    if (!p) return track(realloc(NULL, n));
+    size_t i;
+    for (i = 0; i < live_count; i++)
+        if (live_allocations[i] == p) break;
+    assert(i < live_count);
+    void *replacement = realloc(p, n);
+    if (replacement) live_allocations[i] = replacement;
+    return replacement;
+}
+static void job_free(void *p) {
+    if (!p) return;
+    size_t i;
+    for (i = 0; i < live_count; i++)
+        if (live_allocations[i] == p) break;
+    assert(i < live_count);
+    live_allocations[i] = live_allocations[--live_count];
+    free(p);
+}
+#define malloc job_malloc
+#define calloc job_calloc
+#define strdup job_strdup
+#define realloc job_realloc
+#define free job_free
+""" + "\n".join(line for line in SOURCE.splitlines() if re.match(
+    r"#define STRATUM_MAX_(?:JOB_ID|COINBASE_BYTES|MERKLE_BRANCHES|XNONCE1_BYTES)\b", line
+)) + "\n" + function("stratum_hex_field") + function("stratum_parse_extranonce") + function("getblocheight") + function("stratum_job_id_valid") + function("stratum_free_job_payload") + function("solominer_valid_job_event") + function("stratum_notify") + r"""
+struct work {
+    char *job_id;
+    size_t xnonce2_len;
+    uchar *xnonce2;
+    int height;
+    double targetdiff;
+    unsigned int data[32];
+    uchar target[32];
+};
+static pthread_rwlock_t g_work_lock = PTHREAD_RWLOCK_INITIALIZER;
+static double opt_target_factor = 1, opt_diff_factor = 1, net_diff;
+static time_t g_work_time;
+static int restart_count;
+static void build_extraheader(struct work *work, struct stratum_ctx *ctx) {
+    (void)ctx; work->data[0] = 0x1d00ffff;
+}
+static void set_work_data_endian(struct work *work) { (void)work; }
+static struct {
+    int nbits_index;
+    void (*build_extraheader)(struct work *, struct stratum_ctx *);
+    void (*set_work_data_endian)(struct work *);
+} algo_gate = {0, build_extraheader, set_work_data_endian};
+static double nbits_to_diff(unsigned int bits) { (void)bits; return 1; }
+static void diff_to_hash(uchar *target, double diff) { (void)diff; memset(target, 0, 32); }
+static void restart_threads(void) { restart_count++; }
+""" + WORK_ACTIVATION_PREFIX + r"""
+static char hash_hex[65], coinb1_hex[65];
+static json_t fields[9], branches[1100], branch_array, params;
+static json_t *field_ptrs[9], *branch_ptrs[1100];
+static int event_read_fd;
+static void fixture(size_t count) {
+    memset(hash_hex, 'a', 64); hash_hex[64] = 0;
+    memset(coinb1_hex, '0', 64); coinb1_hex[64] = 0;
+    const char *values[9] = {"job-1", hash_hex, coinb1_hex, "", NULL,
+                             "20000000", "1d00ffff", "65abcdef", NULL};
+    for (size_t i = 0; i < 9; i++) {
+        fields[i] = (json_t){.kind = J_STRING, .string = values[i]};
+        field_ptrs[i] = &fields[i];
+    }
+    for (size_t i = 0; i < 1100; i++) {
+        branches[i] = (json_t){.kind = J_STRING, .string = hash_hex};
+        branch_ptrs[i] = &branches[i];
+    }
+    branch_array = (json_t){.kind = J_ARRAY, .items = branch_ptrs, .count = count};
+    fields[4] = branch_array;
+    fields[8] = (json_t){.kind = J_BOOLEAN, .integer = 1};
+    params = (json_t){.kind = J_ARRAY, .items = field_ptrs, .count = 9};
+}
+static void assert_event(bool expected) {
+    char c = 0;
+    ssize_t n = read(event_read_fd, &c, 1);
+    if (expected) assert(n == 1 && c == 'J');
+    else assert(n == -1 && errno == EAGAIN);
+}
+int main(void) {
+    struct stratum_ctx ctx = {0};
+    struct work active_work = {0};
+    int event_pipe[2];
+    char fd_text[32];
+    assert(pthread_mutex_init(&ctx.work_lock, NULL) == 0);
+    assert(pipe(event_pipe) == 0);
+    event_read_fd = event_pipe[0];
+    assert(fcntl(event_read_fd, F_SETFL, O_NONBLOCK) == 0);
+    snprintf(fd_text, sizeof(fd_text), "%d", event_pipe[1]);
+    assert(setenv("SOLOMINER_EVENT_FD", fd_text, 1) == 0);
+    ctx.xnonce1 = malloc(4);
+    assert(ctx.xnonce1);
+    memset(ctx.xnonce1, 0x42, 4);
+    ctx.xnonce1_size = 4;
+    ctx.xnonce2_size = 4;
+    ctx.next_diff = 1.0;
+
+    /* Every truncated height encoding must stay inside its allocation. */
+    struct stratum_ctx height_ctx = {0};
+    for (size_t n = 0; n <= 38; n++) {
+        uchar *short_coinbase = malloc(n ? n : 1);
+        assert(short_coinbase);
+        memset(short_coinbase, 0, n ? n : 1);
+        if (n > 32) short_coinbase[32] = 0xff;
+        if (n > 33) short_coinbase[33] = 0xff;
+        if (n > 34) short_coinbase[34] = 0x27;
+        if (n > 35) short_coinbase[35] = 3;
+        if (n > 36) short_coinbase[36] = 0xe8;
+        if (n > 37) short_coinbase[37] = 0x33;
+        height_ctx.job.coinbase = short_coinbase;
+        height_ctx.job.coinbase_size = n;
+        assert(getblocheight(&height_ctx) == 0);
+        free(short_coinbase);
+    }
+    uchar tagged_coinbase[42] = {0};
+    tagged_coinbase[32] = 0xff; tagged_coinbase[33] = 0xff;
+    tagged_coinbase[34] = 0x27; tagged_coinbase[35] = 3;
+    tagged_coinbase[36] = 0xe8; tagged_coinbase[37] = 0x33; tagged_coinbase[38] = 0x13;
+    height_ctx.job.coinbase = tagged_coinbase;
+    height_ctx.job.coinbase_size = sizeof(tagged_coinbase);
+    assert(getblocheight(&height_ctx) == 0x1333e8);
+
+    fixture(10);
+    assert(stratum_notify(&ctx, &params));
+    assert(ctx.new_job && ctx.job.merkle_count == 10);
+    assert_event(false); /* Publication alone is not work activation. */
+    stratum_gen_work(&ctx, &active_work);
+    assert_event(true);
+    assert(!ctx.new_job && restart_count == 1);
+    assert(fcntl(event_pipe[1], F_GETFL) & O_NONBLOCK);
+    struct stratum_job before = ctx.job;
+    ctx.new_job = false;
+    branches[0].string = "gg";
+    assert(!stratum_notify(&ctx, &params));
+    assert(ctx.job.coinbase == before.coinbase && ctx.job.merkle == before.merkle);
+    assert(!ctx.new_job);
+    assert_event(false);
+    branches[0].string = hash_hex;
+    fields[1].string = "gg";
+    assert(!stratum_notify(&ctx, &params));
+    assert_event(false);
+    fields[1].string = hash_hex;
+    fields[2].string = "0"; /* odd hex, undersized coinbase */
+    assert(!stratum_notify(&ctx, &params));
+    assert_event(false);
+    fields[2].string = coinb1_hex;
+    fields[0].string = "bad\njob"; /* log-control bytes rejected */
+    assert(!stratum_notify(&ctx, &params));
+    assert_event(false);
+    fields[0].string = "job-1";
+    fields[4].count = 1025;
+    assert(!stratum_notify(&ctx, &params));
+    assert_event(false);
+    fields[4].count = 10;
+
+    /* An allocation failure keeps the previous complete job intact. */
+    for (int offset = 1; offset <= 13; offset++) {
+        fail_at = allocation_count + offset;
+        bool result = stratum_notify(&ctx, &params);
+        fail_at = 0;
+        assert(!result);
+        assert(ctx.job.coinbase == before.coinbase && ctx.job.merkle == before.merkle);
+        assert_event(false);
+    }
+    fields[4].count = 1;
+    assert(stratum_notify(&ctx, &params)); assert_event(false);
+    stratum_gen_work(&ctx, &active_work); assert_event(true);
+    fields[4].count = 11;
+    assert(stratum_notify(&ctx, &params)); assert_event(false);
+    stratum_gen_work(&ctx, &active_work); assert_event(true);
+    assert(ctx.job.merkle_count == 11 && ctx.job.merkle_buf_size == 11);
+
+    /* Both work-allocation failure points retain the pending new job. */
+    assert(stratum_notify(&ctx, &params));
+    fail_at = allocation_count + 1;
+    stratum_gen_work(&ctx, &active_work);
+    fail_at = 0;
+    assert(ctx.new_job && restart_count == 3); assert_event(false);
+    fail_at = allocation_count + 2;
+    stratum_gen_work(&ctx, &active_work);
+    fail_at = 0;
+    assert(ctx.new_job && restart_count == 3); assert_event(false);
+    stratum_gen_work(&ctx, &active_work);
+    assert(!ctx.new_job && restart_count == 4); assert_event(true);
+
+    /* Invalid extranonce updates preserve the previous decoded value. */
+    json_t x1 = {.kind = J_STRING, .string = "gg"};
+    json_t x2 = {.kind = J_INTEGER, .integer = 4};
+    json_t *x_items[2] = {&x1, &x2};
+    json_t extras = {.kind = J_ARRAY, .items = x_items, .count = 2};
+    uchar *previous_xnonce1 = ctx.xnonce1;
+    assert(!stratum_parse_extranonce(&ctx, &extras, 0));
+    assert(ctx.xnonce1 == previous_xnonce1);
+    x1.string = "a";
+    assert(!stratum_parse_extranonce(&ctx, &extras, 0));
+    assert(ctx.xnonce1 == previous_xnonce1);
+    x1.string = "ab"; x2.integer = LLONG_MAX;
+    assert(!stratum_parse_extranonce(&ctx, &extras, 0));
+    assert(ctx.xnonce1 == previous_xnonce1);
+    x2.integer = 4;
+    assert(stratum_parse_extranonce(&ctx, &extras, 0));
+    assert(ctx.xnonce1_size == 1 && ctx.xnonce1[0] == 0xab);
+
+    /* A flood of valid jobs cannot block forever on an undrained pipe. */
+    char fill[4096] = {0};
+    while (write(event_pipe[1], fill, sizeof(fill)) > 0) {}
+    assert(errno == EAGAIN);
+    assert(stratum_notify(&ctx, &params));
+    stratum_gen_work(&ctx, &active_work);
+    char drain[4096];
+    while (read(event_read_fd, drain, sizeof(drain)) > 0) {}
+    assert(errno == EAGAIN);
+
+    /* A supervisor disappearing must not terminate the miner via SIGPIPE. */
+    int broken_pipe[2];
+    assert(pipe(broken_pipe) == 0);
+    close(broken_pipe[0]);
+    snprintf(fd_text, sizeof(fd_text), "%d", broken_pipe[1]);
+    assert(setenv("SOLOMINER_EVENT_FD", fd_text, 1) == 0);
+    assert(stratum_notify(&ctx, &params));
+    stratum_gen_work(&ctx, &active_work);
+    close(broken_pipe[1]);
+
+    stratum_free_job_payload(&ctx.job);
+    free(ctx.xnonce1);
+    free(active_work.job_id);
+    free(active_work.xnonce2);
+    close(event_pipe[0]); close(event_pipe[1]);
+    pthread_mutex_destroy(&ctx.work_lock);
+    assert(live_count == 0);
+    return 0;
+}
+"""
+
+
 class UpstreamPatchTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -407,7 +755,7 @@ class UpstreamPatchTests(unittest.TestCase):
         thermal = THERMAL_HARNESS.replace("@HWMON_ROOT@", json.dumps(str(cls.hwmon)))
         # Optional sanitizer mode is useful in CI and on Linux. No miner runs.
         extra = ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if os.environ.get("SANITIZE") == "1" else []
-        for name, harness in (("buffer", BUFFER_HARNESS), ("tls", TLS_HARNESS), ("send", SEND_HARNESS), ("thermal", thermal)):
+        for name, harness in (("buffer", BUFFER_HARNESS), ("tls", TLS_HARNESS), ("send", SEND_HARNESS), ("thermal", thermal), ("job", JOB_HARNESS)):
             cfile = Path(cls.tmp.name) / f"{name}.c"
             binary = Path(cls.tmp.name) / name
             cfile.write_text(harness)
@@ -477,6 +825,20 @@ class UpstreamPatchTests(unittest.TestCase):
         self.assertIn("size_t n = 0;", function("send_line"))
         self.assertNotIn("(size_t *)&n", function("send_line"))
         self.run_case("send")
+
+    def test_stratum_job_validation_allocation_and_event(self):
+        self.run_case("job")
+
+    def test_rejected_notification_never_marks_new_job(self):
+        self.assertIn("sctx->new_job = true;", function("stratum_notify"))
+        self.assertNotIn("solominer_valid_job_event();", function("stratum_notify"))
+        method_case = SOURCE.split('if (!strcasecmp(method, "mining.notify")) {', 1)[1]
+        method_case = method_case.split('if (!strcasecmp(method, "mining.ping"))', 1)[0]
+        self.assertNotIn("sctx->new_job = true;", method_case)
+        activated_work = function("stratum_gen_work")
+        self.assertIn("if ( new_job )\n      solominer_valid_job_event();", activated_work)
+        self.assertLess(activated_work.index("restart_threads();"),
+                        activated_work.index("solominer_valid_job_event();"))
 
     def test_apply_to_exact_pinned_source(self):
         upstream = os.environ.get("CPUMINER_SOURCE")

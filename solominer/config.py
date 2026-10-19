@@ -87,7 +87,7 @@ def _boolean(value: str, name: str) -> bool:
     raise ConfigError(f'{name} must be true or false.')
 
 
-def validate_pool(pool: str, allow_insecure: bool = True) -> str:
+def validate_pool(pool: str, allow_insecure: bool = False) -> str:
     """Constrain destination syntax; DNS/IP reachability is deliberately not guessed."""
     try:
         parsed = urlsplit(pool)
@@ -129,7 +129,7 @@ class Config:
     no_redirect: bool = True
     retry_pause: int = 30
     health_timeout: int = 900
-    allow_insecure_pool: bool = True
+    allow_insecure_pool: bool = False
     fallback_pools: tuple[str, ...] = ()
 
     def miner_args(self, binary: str | Path = DEFAULT_BINARY) -> list[str]:
@@ -153,6 +153,11 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> Config:
             contents = source.read(65537)
     except (OSError, UnicodeError) as exc:
         raise ConfigError(f'Cannot read configuration {path}: {exc}') from exc
+    return parse_config(contents, path)
+
+
+def parse_config(contents: str, path: Path | str = '<candidate>') -> Config:
+    """Validate one immutable snapshot of assignment-only configuration text."""
     if len(contents) > 65536:
         raise ConfigError('Configuration is larger than 64 KiB.')
     allowed = {'POOL', 'WALLET', 'WORKER', 'THREADS', 'MAX_TEMP', 'CPU_QUOTA', 'MEMORY_MAX',
@@ -183,7 +188,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> Config:
     for required in ('POOL', 'WALLET', 'WORKER', 'THREADS'):
         if required not in values:
             raise ConfigError(f'Missing {required} in {path}.')
-    allow_insecure = _boolean(values.get('ALLOW_INSECURE_POOL', 'true'), 'ALLOW_INSECURE_POOL')
+    allow_insecure = _boolean(values.get('ALLOW_INSECURE_POOL', 'false'), 'ALLOW_INSECURE_POOL')
     validate_pool(values['POOL'], allow_insecure)
     fallback_pools = tuple(values.get('FALLBACK_POOLS', '').split(',')) if values.get('FALLBACK_POOLS') else ()
     if len(fallback_pools) > 3 or len(set((values['POOL'], *fallback_pools))) != 1 + len(fallback_pools):
@@ -213,8 +218,11 @@ def load_config(path: Path | str = DEFAULT_CONFIG) -> Config:
     memory_bytes = int(memory_match[1]) * (1024 ** (2 if memory_match[2] == 'M' else 3))
     if not 64 * 1024**2 <= memory_bytes <= 64 * 1024**3:
         raise ConfigError('MEMORY_MAX must be between 64M and 64G.')
+    tasks_max = _integer(values.get('TASKS_MAX', '64'), 'TASKS_MAX', 16, 4096)
+    if tasks_max < threads + 8:
+        raise ConfigError(f'TASKS_MAX must be at least THREADS + 8 ({threads + 8}) for the miner, network and supervisor threads.')
     return Config(values['POOL'], values['WALLET'], values['WORKER'], threads, max_temp, cpu_quota,
-                  memory_max, _integer(values.get('TASKS_MAX', '64'), 'TASKS_MAX', 16, 4096),
+                  memory_max, tasks_max,
                   _boolean(values.get('NO_REDIRECT', 'true'), 'NO_REDIRECT'),
                   _integer(values.get('RETRY_PAUSE', '30'), 'RETRY_PAUSE', 5, 600),
                   _integer(values.get('HEALTH_TIMEOUT', '900'), 'HEALTH_TIMEOUT', 120, 86400),

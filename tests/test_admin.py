@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import stat
 import tempfile
 from types import SimpleNamespace
@@ -17,6 +18,17 @@ import unittest
 from unittest.mock import patch
 
 from solominer import admin
+
+
+class HostPreflightTests(unittest.TestCase):
+    def test_atomic_fedora_is_rejected_before_installation_can_mutate_host(self):
+        with patch.object(admin.os, 'geteuid', return_value=0), \
+             patch.object(Path, 'is_file', return_value=True), \
+             patch.object(Path, 'exists', return_value=True), \
+             patch.object(admin, 'update_lock') as update_lock:
+            with self.assertRaisesRegex(admin.AdminError, 'Atomic/rpm-ostree'):
+                admin.install_or_update(SimpleNamespace(install_deps=True))
+        update_lock.assert_not_called()
 
 
 class IdentitySecurityTests(unittest.TestCase):
@@ -270,7 +282,10 @@ class BuildBoundaryTests(unittest.TestCase):
                          '--property=NoNewPrivileges=yes', '--property=ProtectSystem=strict',
                          '--property=PrivateNetwork=yes', '--property=ProtectHome=yes',
                          '--property=CapabilityBoundingSet=', '--property=KillMode=control-group',
-                         '--property=MemoryMax=2G', '--property=CPUQuota=200%',
+                         '--property=MemoryMax=2G', '--property=MemorySwapMax=512M',
+                         '--property=TasksMax=256', '--property=CPUQuota=200%',
+                         '--property=TemporaryFileSystem=/tmp:rw,size=512M,mode=1777',
+                         '--property=InaccessiblePaths=/var/tmp', 'TMPDIR=/tmp',
                          '--property=RuntimeMaxSec=30min', f'--property=ReadWritePaths={workspace}'):
             self.assertIn(required, command)
         self.assertIn('/usr/bin/env', command)
@@ -278,31 +293,249 @@ class BuildBoundaryTests(unittest.TestCase):
         self.assertEqual(command[-2:], ['/bin/bash', str(workspace / 'driver.sh')])
         self.assertFalse(any('shell=True' in argument for argument in command))
 
+    def test_fetch_is_the_only_sandbox_action_with_network(self):
+        workspace = Path('/var/lib/solominer-build/private-fixture')
+        fetch = admin.builder_command(['git', 'fetch'], workspace, network=True)
+        local = admin.builder_command(['git', 'checkout'], workspace)
+        self.assertNotIn('--property=PrivateNetwork=yes', fetch)
+        self.assertIn('--property=PrivateNetwork=yes', local)
+        for required in ('--uid=solominer-build', '--property=NoNewPrivileges=yes',
+                         '--property=ProtectSystem=strict', '--property=MemoryMax=2G',
+                         f'--property=ReadWritePaths={workspace}'):
+            self.assertIn(required, fetch)
+
+    def test_interrupted_fetch_is_stopped_before_workspace_cleanup(self):
+        failure = KeyboardInterrupt()
+        with patch.object(admin, 'command', side_effect=[failure, SimpleNamespace(returncode=0)]) as command:
+            with self.assertRaises(KeyboardInterrupt):
+                admin.run_builder(['git', 'fetch'], Path('/var/lib/solominer-build/fixture'),
+                                  timeout=1, network=True)
+        start = command.call_args_list[0].args[0]
+        unit = next(argument.removeprefix('--unit=') for argument in start if argument.startswith('--unit='))
+        self.assertTrue(unit.startswith('solominer-fetch-'))
+        self.assertEqual(command.call_args_list[1].args[0], ['systemctl', 'stop', unit])
+
+    def test_elf_requires_system_jansson_dependency(self):
+        libraries = ' 0x0000000000000001 (NEEDED) Shared library: [libjansson.so.4]\n'
+        with patch.object(admin, 'run_builder', return_value=SimpleNamespace(stdout=libraries)):
+            self.assertEqual(admin.needed_libraries(Path('/fixture/cpuminer'), Path('/fixture')),
+                             ['libjansson.so.4'])
+        with patch.object(admin, 'run_builder', return_value=SimpleNamespace(stdout='')):
+            with self.assertRaisesRegex(admin.AdminError, 'system Jansson'):
+                admin.needed_libraries(Path('/fixture/cpuminer'), Path('/fixture'))
+
+    def test_low_build_disk_space_is_rejected_before_fetch(self):
+        with patch.object(admin, 'secure_dir'), \
+             patch.object(admin.shutil, 'disk_usage', return_value=SimpleNamespace(free=100 * 1024**2)), \
+             patch.object(admin, 'run_builder') as builder:
+            with self.assertRaisesRegex(admin.AdminError, '1 GiB'):
+                with admin.built_candidate():
+                    pass
+        builder.assert_not_called()
+
     def test_source_is_fixed_immutable_revision_and_https_origin(self):
         self.assertRegex(admin.UPSTREAM_REVISION, r'^[a-f0-9]{40}$')
         self.assertEqual(admin.UPSTREAM_REPO, 'https://github.com/JayDDee/cpuminer-opt.git')
         self.assertEqual(admin.UPSTREAM_REVISION, 'b34565bfaca5da9ed894a326e3ba0dfe459550a4')
+
+    def test_candidate_fetch_is_only_network_step_and_records_build_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'builder'
+            root.mkdir()
+            def secure(path, mode=0o755):
+                path.mkdir(parents=True, exist_ok=True)
+            def fake_builder(argv, workspace, timeout, **kwargs):
+                if argv[:2] == ['git', '-c'] and 'rev-parse' in argv:
+                    return SimpleNamespace(stdout=admin.UPSTREAM_REVISION + '\n')
+                if argv[:2] == ['/bin/bash', str(workspace / 'build-miner.sh')]:
+                    (workspace / 'source/cpuminer').write_bytes(b'\x7fELF-fixture')
+                if argv[:3] == ['readelf', '-W', '-d']:
+                    return SimpleNamespace(stdout='(NEEDED) Shared library: [libjansson.so.4]\n')
+                if argv[:2] == ['gcc', '-dumpfullversion']:
+                    return SimpleNamespace(stdout='gcc 16.1')
+                return SimpleNamespace(stdout='')
+            with patch.object(admin, 'BUILDER_ROOT', root), \
+                 patch.object(admin, 'secure_dir', side_effect=secure), \
+                 patch.object(admin.shutil, 'disk_usage', return_value=SimpleNamespace(free=2 * 1024**3)), \
+                 patch.object(admin.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=991, pw_gid=991)), \
+                 patch.object(admin.os, 'chown'), \
+                 patch.object(admin, 'run_builder', side_effect=fake_builder) as builder, \
+                 patch.object(admin.platform, 'freedesktop_os_release',
+                              return_value={'PRETTY_NAME': 'Fedora Linux 44', 'VERSION_ID': '44'}), \
+                 patch.object(admin.platform, 'machine', return_value='x86_64'):
+                with admin.built_candidate() as (binary, metadata):
+                    self.assertEqual(binary, b'\x7fELF-fixture')
+                    self.assertEqual(metadata['fedora_version'], '44')
+                    self.assertEqual(metadata['architecture'], 'x86_64')
+                    self.assertEqual(metadata['compiler'], 'gcc 16.1')
+                    self.assertEqual(metadata['linked_libraries'], ['libjansson.so.4'])
+            online = [call for call in builder.call_args_list if call.kwargs.get('network')]
+            self.assertEqual(len(online), 1)
+            self.assertIn('fetch', online[0].args[0])
+            self.assertTrue(all('network' not in call.kwargs or not call.kwargs['network']
+                                for call in builder.call_args_list if call not in online))
+
+
+class BuildScriptTests(unittest.TestCase):
+    def _run_fixture(self, *, pkg_config_ok, jansson_probe):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / 'bin'
+            fake_bin.mkdir()
+            (fake_bin / 'pkg-config').write_text('#!/bin/sh\nexit ' + ('0' if pkg_config_ok else '1') + '\n')
+            (fake_bin / 'pkg-config').chmod(0o755)
+            (root / 'autogen.sh').write_text('#!/bin/sh\ntouch autogen-ran\n')
+            (root / 'autogen.sh').chmod(0o755)
+            (root / 'configure').write_text(
+                '#!/bin/sh\nprintf "ac_cv_lib_jansson_json_loads=' + jansson_probe + '\\n" > config.log\n')
+            (root / 'configure').chmod(0o755)
+            (fake_bin / 'make').write_text('#!/bin/sh\ntouch make-ran\n')
+            (fake_bin / 'make').chmod(0o755)
+            result = subprocess.run(['bash', str(admin.SOURCE_ROOT / 'scripts/build-miner.sh')],
+                                    cwd=root, env={'PATH': f'{fake_bin}:/usr/bin:/bin'},
+                                    capture_output=True, text=True, check=False)
+            return result, (root / 'autogen-ran').exists(), (root / 'make-ran').exists()
+
+    def test_missing_system_jansson_stops_before_autogen(self):
+        result, autogen, make = self._run_fixture(pkg_config_ok=False, jansson_probe='yes')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('bundled Jansson fallback', result.stderr)
+        self.assertFalse(autogen)
+        self.assertFalse(make)
+
+    def test_configure_fallback_stops_before_make(self):
+        result, autogen, make = self._run_fixture(pkg_config_ok=True, jansson_probe='no')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(autogen)
+        self.assertFalse(make)
+
+    def test_system_jansson_build_path_continues(self):
+        result, autogen, make = self._run_fixture(pkg_config_ok=True, jansson_probe='yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(autogen)
+        self.assertTrue(make)
 
 
 class ActivationTests(unittest.TestCase):
     def test_failed_activation_restores_previous_installation(self):
         states = {admin.SERVICE: {'active': True, 'enabled': True},
                   admin.HEALTH_TIMER: {'active': True, 'enabled': True}}
-        with patch.object(admin, 'secure_install_dir'), \
+        config = object()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        admin_dir = Path(temporary.name)
+        with patch.object(admin, 'ADMIN_DIR', admin_dir), \
+                patch.object(admin, 'secure_install_dir'), \
                 patch.object(admin, 'snapshot', return_value='fixture-backup') as snapshot, \
                 patch.object(admin, 'unit_states', return_value=states), \
                 patch.object(admin, 'stop_units'), \
                 patch.object(admin, 'atomic_write') as write, \
                 patch.object(admin, 'install_bundle'), \
+                patch.object(admin, 'config_from_data', return_value=config), \
+                patch.object(admin, 'read_regular', return_value=b'validated config'), \
                 patch.object(admin, 'write_units', side_effect=admin.AdminError('fixture validation failure')), \
                 patch.object(admin, 'command') as command, \
                 patch.object(admin, 'restore_backup') as restore:
             with self.assertRaises(admin.AdminError):
-                admin.activate(b'fixture', {}, object())
+                admin.activate(b'fixture', {}, config)
         snapshot.assert_called_once_with(states)
         restore.assert_called_once_with('fixture-backup')
         command.assert_not_called()
-        self.assertFalse(any(call.args[0] == admin.ADMIN_DIR / 'last-backup' for call in write.call_args_list))
+        self.assertFalse(any(call.args[0] == admin_dir / 'last-backup' for call in write.call_args_list))
+        self.assertFalse(any(call.args[0] == admin_dir / 'last-good-config' for call in write.call_args_list))
+
+    def test_successful_activation_records_last_good_only_after_startup_verification(self):
+        events = []
+        config = object()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        admin_dir = Path(temporary.name)
+        def write(path, data, *args):
+            if path == admin_dir / 'last-good-config':
+                events.append(('last-good', data))
+        with patch.object(admin, 'ADMIN_DIR', admin_dir), \
+             patch.object(admin, 'secure_install_dir'), \
+             patch.object(admin, 'snapshot', return_value='fixture-backup'), \
+             patch.object(admin, 'unit_states', return_value={}), \
+             patch.object(admin, 'stop_units'), \
+             patch.object(admin, 'atomic_write', side_effect=write), \
+             patch.object(admin, 'install_bundle'), \
+             patch.object(admin, 'config_from_data', return_value=config), \
+             patch.object(admin, 'write_units'), \
+             patch.object(admin, 'command'), \
+             patch.object(admin, 'read_regular', return_value=b'validated config'), \
+             patch.object(admin, 'verify_started', side_effect=lambda: events.append(('verified', None))):
+            admin.activate(b'fixture ELF', {}, config)
+        self.assertEqual(events, [('verified', None), ('last-good', b'validated config')])
+
+    def test_changed_configuration_aborts_activation_before_downtime(self):
+        config = object()
+        with patch.object(admin, 'secure_install_dir'), \
+             patch.object(admin, 'read_regular', return_value=b'fixture config'), \
+             patch.object(admin, 'config_from_data', return_value=object()), \
+             patch.object(admin, 'snapshot') as snapshot, \
+             patch.object(admin, 'stop_units') as stop:
+            with self.assertRaisesRegex(admin.AdminError, 'changed during the build'):
+                admin.activate(b'fixture', {}, config)
+        snapshot.assert_not_called()
+        stop.assert_not_called()
+
+    def test_partial_stop_during_activation_attempts_release_restore(self):
+        config = object()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(admin, 'ADMIN_DIR', Path(directory)), \
+             patch.object(admin, 'secure_install_dir'), \
+             patch.object(admin, 'read_regular', return_value=b'validated config'), \
+             patch.object(admin, 'config_from_data', return_value=config), \
+             patch.object(admin, 'snapshot', return_value='fixture-backup'), \
+             patch.object(admin, 'unit_states', return_value={}), \
+             patch.object(admin, 'stop_units', side_effect=admin.AdminError('partial stop')), \
+             patch.object(admin, 'atomic_write') as write, \
+             patch.object(admin, 'restore_backup') as restore:
+            with self.assertRaisesRegex(admin.AdminError, 'partial stop'):
+                admin.activate(b'fixture', {}, config)
+        restore.assert_called_once_with('fixture-backup')
+        write.assert_not_called()
+
+    def test_failed_activation_pointer_write_restores_prior_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            live = root / 'current.env'
+            live.write_bytes(b'validated config')
+            good = root / 'last-good-config'
+            good.write_bytes(b'prior good')
+            backup = root / 'last-backup'
+            backup.write_bytes(b'prior backup')
+            config = object()
+            original_write = admin.atomic_write
+            def secure(path, mode=0o755):
+                path.mkdir(parents=True, exist_ok=True)
+            def fail_new_pointer(path, data, *args):
+                if path == backup and data == b'new-backup':
+                    raise OSError('fixture metadata write failed')
+                if path in (good, backup):
+                    return original_write(path, data, *args)
+            with patch.object(admin, 'ADMIN_DIR', root), \
+                 patch.object(admin, 'DEFAULT_CONFIG', live), \
+                 patch.object(admin, 'secure_dir', side_effect=secure), \
+                 patch.object(admin.os, 'fchown'), \
+                 patch.object(admin, 'secure_install_dir'), \
+                 patch.object(admin, 'config_from_data', return_value=config), \
+                 patch.object(admin, 'snapshot', return_value='new-backup'), \
+                 patch.object(admin, 'unit_states', return_value={}), \
+                 patch.object(admin, 'stop_units'), \
+                 patch.object(admin, 'atomic_write', side_effect=fail_new_pointer), \
+                 patch.object(admin, 'install_bundle'), \
+                 patch.object(admin, 'write_units'), \
+                 patch.object(admin, 'command'), \
+                 patch.object(admin, 'verify_started') as verify, \
+                 patch.object(admin, 'restore_backup') as restore:
+                with self.assertRaisesRegex(OSError, 'metadata write failed'):
+                    admin.activate(b'fixture', {}, config)
+            verify.assert_called_once()
+            restore.assert_called_once_with('new-backup')
+            self.assertEqual(good.read_bytes(), b'prior good')
+            self.assertEqual(backup.read_bytes(), b'prior backup')
 
     def test_unstable_pid_during_startup_is_rejected(self):
         responses = [SimpleNamespace(stdout=pid) for pid in ('100', '100', '101')]
@@ -337,6 +570,161 @@ class ActivationTests(unittest.TestCase):
         command.assert_not_called()
         self.assertEqual(write.call_count, 2)
         self.assertTrue(all('staged' in str(call.args[0]) for call in write.call_args_list))
+
+
+class ConfigTransactionTests(unittest.TestCase):
+    BASE = (b'POOL=stratum+ssl://pool.example.invalid:443\n'
+            b'WALLET=1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa\n'
+            b'WORKER=ci_fixture\nTHREADS=1\nCPU_QUOTA=50%\n')
+    UPDATED = BASE.replace(b'CPU_QUOTA=50%', b'CPU_QUOTA=75%')
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.live = self.root / 'etc/sysconfig/btc-solo-cpu'
+        self.live.parent.mkdir(parents=True)
+        self.live.write_bytes(self.BASE)
+        self.admin_dir = self.root / 'admin'
+        self.admin_dir.mkdir()
+        (self.admin_dir / 'last-good-config').write_bytes(self.BASE)
+        self.candidate = self.root / 'candidate.env'
+        self.candidate.write_bytes(self.UPDATED)
+        def secure(path, mode=0o755):
+            path.mkdir(parents=True, exist_ok=True)
+        substitutions = (
+            patch.object(admin, 'DEFAULT_CONFIG', self.live),
+            patch.object(admin, 'ADMIN_DIR', self.admin_dir),
+            patch.object(admin, 'require_host'),
+            patch.object(admin, 'update_lock', return_value=nullcontext()),
+            patch.object(admin, 'secure_dir', side_effect=secure),
+            patch.object(admin, 'ensure_users'),
+            patch.object(admin.os, 'fchown'),
+            patch.object(admin.pwd, 'getpwnam', return_value=SimpleNamespace(pw_gid=991)),
+            patch.object(admin, 'unit_states', return_value={
+                admin.SERVICE: {'active': True, 'enabled': True},
+                admin.HEALTH_TIMER: {'active': True, 'enabled': True}}),
+            patch.object(admin, 'snapshot', return_value='fixture-backup'),
+            patch.object(admin, 'stop_units'),
+            patch.object(admin, 'write_units'),
+            patch.object(admin, 'command', return_value=SimpleNamespace(returncode=1)),
+            patch.object(admin, 'verify_started'),
+            patch.object(admin, 'restore_backup'),
+        )
+        self.mocks = {}
+        for substitution in substitutions:
+            mocked = substitution.start()
+            self.addCleanup(substitution.stop)
+            self.mocks[substitution.attribute] = mocked
+
+    def test_candidate_apply_success_persists_exact_validated_bytes(self):
+        admin.apply_config(self.candidate)
+        self.assertEqual(self.live.read_bytes(), self.UPDATED)
+        self.assertEqual((self.admin_dir / 'last-good-config').read_bytes(), self.UPDATED)
+        self.assertEqual((self.admin_dir / 'last-backup').read_bytes(), b'fixture-backup')
+        self.assertEqual(self.candidate.read_bytes(), self.UPDATED)
+        self.assertFalse((self.admin_dir / 'candidate-config').exists())
+        self.assertEqual(self.mocks['write_units'].call_args.args[0].cpu_quota, '75%')
+        self.assertIn(['systemctl', 'restart', admin.SERVICE],
+                      [call.args[0] for call in self.mocks['command'].call_args_list])
+        self.mocks['verify_started'].assert_called_once()
+        self.mocks['restore_backup'].assert_not_called()
+
+    def test_invalid_live_edit_restores_last_good_without_stopping_service(self):
+        invalid = self.BASE.replace(b'WALLET=1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa', b'WALLET=not-a-wallet')
+        self.live.write_bytes(invalid)
+        with self.assertRaisesRegex(admin.AdminError, 'Invalid live configuration restored'):
+            admin.apply_config()
+        self.assertEqual(self.live.read_bytes(), self.BASE)
+        self.assertEqual((self.admin_dir / 'last-good-config').read_bytes(), self.BASE)
+        self.assertFalse((self.admin_dir / 'candidate-config').exists())
+        rejected = list(self.admin_dir.glob('rejected-config-*'))
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0].read_bytes(), invalid)
+        self.mocks['stop_units'].assert_not_called()
+        self.mocks['snapshot'].assert_not_called()
+        self.assertEqual([call.args[0] for call in self.mocks['command'].call_args_list],
+                         [['systemctl', 'is-failed', '--quiet', admin.SERVICE]])
+        self.mocks['verify_started'].assert_not_called()
+
+    def test_invalid_live_edit_restarts_service_only_when_failed(self):
+        invalid = self.BASE.replace(b'WALLET=1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa', b'WALLET=not-a-wallet')
+        self.live.write_bytes(invalid)
+        def systemctl(argv, **kwargs):
+            if argv == ['systemctl', 'is-failed', '--quiet', admin.SERVICE]:
+                return SimpleNamespace(returncode=0)
+            return SimpleNamespace(returncode=0)
+        self.mocks['command'].side_effect = systemctl
+        with self.assertRaisesRegex(admin.AdminError, 'Invalid live configuration restored'):
+            admin.apply_config()
+        self.assertEqual(self.live.read_bytes(), self.BASE)
+        self.assertEqual([call.args[0] for call in self.mocks['command'].call_args_list],
+                         [['systemctl', 'is-failed', '--quiet', admin.SERVICE],
+                          ['systemctl', 'restart', admin.SERVICE]])
+        self.mocks['verify_started'].assert_called_once()
+        self.mocks['stop_units'].assert_not_called()
+
+    def test_failed_restart_restores_previous_config_and_release(self):
+        def systemctl(argv, **kwargs):
+            if argv == ['systemctl', 'restart', admin.SERVICE]:
+                raise admin.AdminError('fixture restart failed')
+            return SimpleNamespace(returncode=0)
+        self.mocks['command'].side_effect = systemctl
+        with self.assertRaisesRegex(admin.AdminError, 'fixture restart failed'):
+            admin.apply_config(self.candidate)
+        self.assertEqual(self.live.read_bytes(), self.BASE)
+        self.assertEqual((self.admin_dir / 'last-good-config').read_bytes(), self.BASE)
+        self.assertFalse((self.admin_dir / 'last-backup').exists())
+        self.assertFalse((self.admin_dir / 'candidate-config').exists())
+        self.mocks['restore_backup'].assert_called_once_with('fixture-backup')
+
+    def test_partial_stop_during_apply_attempts_release_restore(self):
+        self.mocks['stop_units'].side_effect = admin.AdminError('partial stop')
+        with self.assertRaisesRegex(admin.AdminError, 'partial stop'):
+            admin.apply_config(self.candidate)
+        self.assertEqual(self.live.read_bytes(), self.BASE)
+        self.assertEqual((self.admin_dir / 'last-good-config').read_bytes(), self.BASE)
+        self.mocks['restore_backup'].assert_called_once_with('fixture-backup')
+        self.mocks['write_units'].assert_not_called()
+
+    def test_live_edit_during_validation_aborts_before_service_stop(self):
+        concurrent = self.BASE.replace(b'WORKER=ci_fixture', b'WORKER=concurrent')
+        def edit_during_snapshot(states):
+            self.live.write_bytes(concurrent)
+            return 'fixture-backup'
+        self.mocks['snapshot'].side_effect = edit_during_snapshot
+        with self.assertRaisesRegex(admin.AdminError, 'changed during validation'):
+            admin.apply_config(self.candidate)
+        self.assertEqual(self.live.read_bytes(), concurrent)
+        self.mocks['stop_units'].assert_not_called()
+        self.mocks['restore_backup'].assert_not_called()
+        self.assertEqual((self.admin_dir / 'last-good-config').read_bytes(), self.BASE)
+
+    def test_live_edit_after_stop_is_preserved_when_activation_aborts(self):
+        concurrent = self.BASE.replace(b'WORKER=ci_fixture', b'WORKER=concurrent')
+        self.mocks['stop_units'].side_effect = lambda: self.live.write_bytes(concurrent)
+        with self.assertRaisesRegex(admin.AdminError, 'changed during activation'):
+            admin.apply_config(self.candidate)
+        self.assertEqual(self.live.read_bytes(), concurrent)
+        self.mocks['restore_backup'].assert_called_once_with('fixture-backup')
+        self.assertEqual((self.admin_dir / 'last-good-config').read_bytes(), self.BASE)
+
+    def test_release_restore_is_attempted_when_config_and_pointer_recovery_fail(self):
+        original_write = admin.atomic_write
+        def fail_config_restore(path, data, *args):
+            if path == self.live and data == self.BASE:
+                raise OSError('fixture disk full during config restore')
+            return original_write(path, data, *args)
+        def fail_restart(argv, **kwargs):
+            if argv == ['systemctl', 'restart', admin.SERVICE]:
+                raise admin.AdminError('fixture restart failed')
+            return SimpleNamespace(returncode=0)
+        self.mocks['command'].side_effect = fail_restart
+        with patch.object(admin, 'atomic_write', side_effect=fail_config_restore), \
+             patch.object(admin, 'restore_record', side_effect=OSError('fixture pointer restore failed')):
+            with self.assertRaisesRegex(admin.AdminError, 'recovery is incomplete'):
+                admin.apply_config(self.candidate)
+        self.mocks['restore_backup'].assert_called_once_with('fixture-backup')
 
 
 if __name__ == '__main__':

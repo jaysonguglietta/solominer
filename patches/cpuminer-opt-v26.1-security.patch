@@ -1,8 +1,234 @@
+diff --git a/cpu-miner.c b/cpu-miner.c
+index e356084..b896c48 100644
+--- a/cpu-miner.c
++++ b/cpu-miner.c
+@@ -1994,126 +1994,156 @@ void std_get_new_work( struct work* work, struct work* g_work, int thr_id,
+      *nonceptr = 0xffffffffU / opt_n_threads * thr_id;
+      *end_nonce_ptr = ( 0xffffffffU / opt_n_threads ) * (thr_id+1) - 0x20;
+    }
+    else
+        ++(*nonceptr);
+ }
+ 
+ static void stratum_gen_work( struct stratum_ctx *sctx, struct work *g_work )
+ {
+    bool new_job;
++   char *job_id;
++   uchar *xnonce2;
++   size_t t;
+ 
+    pthread_mutex_lock( &sctx->work_lock );
+ 
++   if ( !sctx->job.job_id || !sctx->job.xnonce2 ||
++        sctx->job.xnonce2_size < 2 || sctx->job.xnonce2_size > 16 )
++   {
++      pthread_mutex_unlock( &sctx->work_lock );
++      return;
++   }
++   job_id = strdup( sctx->job.job_id );
++   if ( !job_id )
++   {
++      pthread_mutex_unlock( &sctx->work_lock );
++      applog( LOG_ERR, "Unable to allocate Stratum work ID" );
++      return;
++   }
++
+    new_job =  sctx->new_job;  // otherwise just increment extranonce2
+-   sctx->new_job = false;
+ 
+    pthread_rwlock_wrlock( &g_work_lock );
+-   
++   xnonce2 = (uchar*) realloc( g_work->xnonce2, sctx->job.xnonce2_size );
++   if ( !xnonce2 )
++   {
++      pthread_rwlock_unlock( &g_work_lock );
++      pthread_mutex_unlock( &sctx->work_lock );
++      free( job_id );
++      applog( LOG_ERR, "Unable to allocate Stratum extranonce2" );
++      return;
++   }
++   sctx->new_job = false;
+    free( g_work->job_id );
+-   g_work->job_id = strdup( sctx->job.job_id );
+-   g_work->xnonce2_len = sctx->xnonce2_size;
+-   g_work->xnonce2 = (uchar*) realloc( g_work->xnonce2, sctx->xnonce2_size );
++   g_work->job_id = job_id;
++   g_work->xnonce2_len = sctx->job.xnonce2_size;
++   g_work->xnonce2 = xnonce2;
+    g_work->height = sctx->block_height;
+    g_work->targetdiff = sctx->job.diff
+                            / ( opt_target_factor * opt_diff_factor );
+-   memcpy( g_work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size );
++   memcpy( g_work->xnonce2, sctx->job.xnonce2, sctx->job.xnonce2_size );
+    algo_gate.build_extraheader( g_work, sctx );
+    net_diff = nbits_to_diff( g_work->data[ algo_gate.nbits_index ] );
+    algo_gate.set_work_data_endian( g_work );
+    diff_to_hash( g_work->target, g_work->targetdiff );
+ 
+    g_work_time = time(NULL);
+    restart_threads();
+    pthread_rwlock_unlock( &g_work_lock );
+ 
+    // Pre increment extranonce2 in case of being called again before receiving
+    // a new job
+-   for ( int t = 0;
+-         t < sctx->xnonce2_size && !( ++sctx->job.xnonce2[t] );
++   for ( t = 0;
++         t < sctx->job.xnonce2_size && !( ++sctx->job.xnonce2[t] );
+          t++ );
+ 
+    pthread_mutex_unlock( &sctx->work_lock );
+ 
++   /* Report freshness only when a validated job became usable work.
++    * Allocation failures above leave new_job set for a later retry. */
++   if ( new_job )
++      solominer_valid_job_event();
++
+    pthread_mutex_lock( &stats_lock );
+ 
+    double hr = 0.;
+    for ( int i = 0; i < opt_n_threads; i++ )
+       hr += thr_hashrates[i];
+    global_hashrate = hr;
+ 
+    pthread_mutex_unlock( &stats_lock );
+ 
+    if ( stratum_diff != sctx->job.diff )
+       applog( LOG_BLUE, "New Stratum Diff %g, Block %d, Tx %d, Job %s",
+                         sctx->job.diff, sctx->block_height,
+                         sctx->job.merkle_count, g_work->job_id );
+    else if ( last_block_height != sctx->block_height )
+       applog( LOG_BLUE, "New Block %d, Tx %d, Netdiff %.5g, Job %s",
+                         sctx->block_height, sctx->job.merkle_count,
+                         net_diff, g_work->job_id );
+    else if ( g_work->job_id && new_job )
+       applog( LOG_BLUE, "New Work: Block %d, Tx %d, Netdiff %.5g, Job %s",
+                          sctx->block_height, sctx->job.merkle_count,
+                          net_diff, g_work->job_id );
+    else if ( opt_debug )
+    {
+       unsigned char *xnonce2str = bebin2hex( g_work->xnonce2,
+                                              g_work->xnonce2_len );
+       applog( LOG_INFO, "Extranonce2 0x%s, Block %d, Job %s",
+                         xnonce2str, sctx->block_height, g_work->job_id );
+       free( xnonce2str );
+    }
+ 
+    // Update data and calculate new estimates.
+    if ( ( stratum_diff != sctx->job.diff )
+      || ( last_block_height != sctx->block_height ) )
+    {
+       if ( unlikely( !session_first_block ) )
+          session_first_block = stratum.block_height;
+       last_block_height = stratum.block_height;
+       stratum_diff      = sctx->job.diff;
+       last_targetdiff   = g_work->targetdiff;
+       if ( lowest_share < last_targetdiff )
+          lowest_share = 9e99;
+     }
+ 
+     if ( new_job && !opt_quiet )
+     {
+        applog2( LOG_INFO, "Diff: Net %.5g, Stratum %.5g, Target %.5g",
+                           net_diff, stratum_diff, g_work->targetdiff );
+ 
+        if ( likely( hr > 0. ) )
+        {
+           double nd = net_diff * exp32;
+           char hr_units[4] = {0};
+           char block_ttf[32];
+           char share_ttf[32];
+           static bool multipool = false;
+       
+           if ( stratum.block_height < last_block_height ) multipool = true;
+             
+           sprintf_et( block_ttf, nd / hr );
+           sprintf_et( share_ttf, ( g_work->targetdiff * exp32 ) / hr );
+           scale_hash_for_display ( &hr, hr_units );
+           applog2( LOG_INFO, "TTF @ %.2f %sh/s: Block %s, Share %s",
+                              hr, hr_units, block_ttf, share_ttf );
+ 
+           if ( !multipool && last_block_height > session_first_block )
+           {
+              struct timeval now, et;
+              gettimeofday( &now, NULL );
+              timeval_subtract( &et, &now, &session_start );
+              uint64_t net_ttf = safe_div( et.tv_sec,
+                                  last_block_height - session_first_block, 0 );
+              if ( net_diff > 0. && net_ttf )
+              {
+                 double net_hr = safe_div( nd, net_ttf, 0. );
+                 char net_hr_units[4] = {0};
+                 scale_hash_for_display ( &net_hr, net_hr_units );
+                 applog2( LOG_INFO, "Net hash rate (est) %.2f %sh/s",
+                                    net_hr, net_hr_units );
+              }
+           }
+        }  // hr > 0
+     } // !quiet
+ }
+diff --git a/miner.h b/miner.h
+index 59441ac..c185c63 100644
+--- a/miner.h
++++ b/miner.h
+@@ -459,27 +459,28 @@ struct work
+ } __attribute__ ((aligned (WORK_ALIGNMENT)));
+ 
+ struct stratum_job
+ {
+ 	unsigned char prevhash[32];
+    unsigned char final_sapling_hash[32];
+    char *job_id;
+ 	size_t coinbase_size;
+ 	unsigned char *coinbase;
+ 	unsigned char *xnonce2;
++	size_t xnonce2_size;
+ 	int merkle_count;
+    int merkle_buf_size;
+    unsigned char **merkle;
+ 	unsigned char version[4];
+ 	unsigned char nbits[4];
+ 	unsigned char ntime[4];
+ 	double diff;
+    bool clean;
+    // for x16rt-veil
+    unsigned char extra[64];
+    unsigned char denom10[32];
+    unsigned char denom100[32];
+    unsigned char denom1000[32];
+    unsigned char denom10000[32];
+    unsigned char proofoffullnode[32];
+ 
+ } __attribute__ ((aligned (64)));
+@@ -511,20 +512,21 @@ struct stratum_ctx {
+ } __attribute__ ((aligned (64)));
+ 
+ bool stratum_socket_full(struct stratum_ctx *sctx, int timeout);
+ bool stratum_send_line(struct stratum_ctx *sctx, char *s);
+ char *stratum_recv_line(struct stratum_ctx *sctx);
+ bool stratum_connect(struct stratum_ctx *sctx, const char *url);
+ void stratum_disconnect(struct stratum_ctx *sctx);
+ bool stratum_subscribe(struct stratum_ctx *sctx);
+ bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *pass);
+ bool stratum_handle_method(struct stratum_ctx *sctx, const char *s);
++void solominer_valid_job_event(void);
+ bool stratum_suggest_difficulty( struct stratum_ctx *sctx, double diff );
+ 
+ 
+ extern bool aes_ni_supported;
+ extern char *rpc_user;
+ extern char *short_url;
+ 
+ struct thread_q;
+ 
+ struct thread_q *tq_new(void);
 diff --git a/sysinfos.c b/sysinfos.c
 index 36d6d1f..274fca0 100644
 --- a/sysinfos.c
 +++ b/sysinfos.c
-@@ -3,136 +3,150 @@
+@@ -1,118 +1,132 @@
+ #if !defined(SYSINFOS_C__)
+ #define SYSINFOS_C__
  
  /**
   * Unit to read cpu informations
@@ -202,51 +428,63 @@ index 36d6d1f..274fca0 100644
   "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq"
  
  static inline float linux_cpufreq(int core)
- {
- 	FILE *fd = fopen( CPUFREQ_PATH0, "r" );
- 	long int freq = 0;
- 
- 	if ( !fd ) return (float)freq;
- 	if ( !fscanf( fd, "%ld", &freq ) ) freq = 0;
-    fclose( fd );
- 	return (float)freq;
- }
- 
- static inline void linux_cpu_hilo_freq( float *lo, float *hi )
- {
-    long int freq = 0, hi_freq = 0, lo_freq = 0x7fffffff;
- 
-    for ( int i = 0; i < num_cpus; i++ )
-    {
-       char path[64];
-       sprintf( path, CPUFREQ_PATHn, i );   
-       FILE *fd = fopen( path, "r" );
-       if ( !fd ) return;
 diff --git a/util.c b/util.c
-index 65d673f..bb4f403 100644
+index 65d673f..c5adc03 100644
 --- a/util.c
 +++ b/util.c
-@@ -535,119 +535,146 @@ static int sockopt_keepalive_cb(void *userdata, curl_socket_t fd,
- 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPCNT,
- 		&tcp_keepcnt, sizeof(tcp_keepcnt))))
- 		return 1;
- 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPIDLE,
- 		&tcp_keepidle, sizeof(tcp_keepidle))))
- 		return 1;
- 	if (unlikely(setsockopt(fd, SOL_TCP, TCP_KEEPINTVL,
- 		&tcp_keepintvl, sizeof(tcp_keepintvl))))
- 		return 1;
- #endif /* __linux */
- #ifdef __APPLE_CC__
- 	if (unlikely(setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE,
- 		&tcp_keepintvl, sizeof(tcp_keepintvl))))
- 		return 1;
- #endif /* __APPLE_CC__ */
- #else /* WIN32 */
- 	struct tcp_keepalive vals;
- 	vals.onoff = 1;
- 	vals.keepalivetime = tcp_keepidle * 1000;
- 	vals.keepaliveinterval = tcp_keepintvl * 1000;
+@@ -1,49 +1,51 @@
+ /*
+  * Copyright 2010 Jeff Garzik
+  * Copyright 2012 Luke Dashjr
+  * Copyright 2012-2014 pooler
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License as published by the Free
+  * Software Foundation; either version 2 of the License, or (at your option)
+  * any later version.  See COPYING for more details.
+  */
+ 
+ #define _GNU_SOURCE
+ #include <cpuminer-config.h>
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <ctype.h>
+ #include <stdarg.h>
+ #include <string.h>
+ #include <stdbool.h>
+ #include <inttypes.h>
+ #include <limits.h>
+ #include <errno.h>
+ #include <unistd.h>
++#include <signal.h>
++#include <fcntl.h>
+ #include <jansson.h>
+ #include <curl/curl.h>
+ #include "sysinfos.c"
+ #include <time.h>
+ #include <sys/stat.h>
+ #include <math.h>
+ //#include <syslog.h>
+ #if defined(WIN32)
+ #include <winsock2.h>
+ #include <mstcpip.h>
+ #include "compat/winansi.h"
+ #else
+ #include <sys/socket.h>
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
+ #endif
+ 
+ #ifndef _MSC_VER
+ /* dirname() linux/mingw, else in compat.h */
+ #include <libgen.h>
+ #endif
+ 
+ #include "elist.h"
+ #include "algo-gate-api.h"
+ #include "algo/sha/sha256d.h"
+@@ -555,178 +557,207 @@ static int sockopt_keepalive_cb(void *userdata, curl_socket_t fd,
  	DWORD outputBytes;
  	if (unlikely(WSAIoctl(fd, SIO_KEEPALIVE_VALS, &vals, sizeof(vals),
  		NULL, 0, &outputBytes, NULL, NULL)))
@@ -396,7 +634,45 @@ index 65d673f..bb4f403 100644
  		have_longpoll = true;
  		tq_push(thr_info[longpoll_thr_id].q, hi.lp_path);
  		hi.lp_path = NULL;
-@@ -693,60 +720,62 @@ json_t *json_rpc_call(CURL *curl, const char *url,
+ 	}
+ 
+ 	if (!all_data.buf) {
+ 		applog(LOG_ERR, "Empty data received in json_rpc_call.");
+ 		goto err_out;
+ 	}
+ 
+ 	json_buf = hack_json_numbers((char*) all_data.buf);
+ 	errno = 0; /* needed for Jansson < 2.1 */
+ 	val = JSON_LOADS(json_buf, &err);
+ 	free(json_buf);
+ 	if (!val) {
+ 		applog(LOG_ERR, "JSON decode failed(%d): %s", err.line, err.text);
+ 		goto err_out;
+ 	}
+ 
+ 	if (opt_protocol) {
+ 		char *s = json_dumps(val, JSON_INDENT(3));
+ 		applog(LOG_DEBUG, "JSON protocol response:\n%s", s);
+ 		free(s);
+ 	}
+ 
+ 	/* JSON-RPC valid response returns a 'result' and a null 'error'. */
+ 	res_val = json_object_get(val, "result");
+ 	err_val = json_object_get(val, "error");
+ 
+ 	if (!res_val || (err_val && !json_is_null(err_val)
+ 		&& !(flags & JSON_RPC_IGNOREERR))) {
+ 
+ 		char *s = NULL;
+ 
+ 		if (err_val) {
+ 			s = json_dumps(err_val, 0);
+ 			json_t *msg = json_object_get(err_val, "message");
+ 			json_t *err_code = json_object_get(err_val, "code");
+ 			if (curl_err && json_integer_value(err_code))
+ 				*curl_err = (int)json_integer_value(err_code);
+ 
+ 			if (msg && json_is_string(msg)) {
  				free(s);
  				s = strdup(json_string_value(msg));
  				if (have_longpoll && s && !strcmp(s, "method not getwork")) {
@@ -439,47 +715,7 @@ index 65d673f..bb4f403 100644
  }
  
  /* used to load a remote config */
- json_t* json_load_url(char* cfg_url, json_error_t *err)
- {
- 	char err_str[CURL_ERROR_SIZE] = { 0 };
- 	struct data_buffer all_data = { 0 };
- 	int rc = 0; json_t *cfg = NULL;
- 	CURL *curl = curl_easy_init();
- 	if (unlikely(!curl)) {
- 		applog(LOG_ERR, "Remote config init failed!");
- 		return NULL;
- 	}
- 	curl_easy_setopt(curl, CURLOPT_URL, cfg_url);
- 	curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1);
- 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15);
- 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, err_str);
- 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
- 	curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1);
- 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, all_data_cb);
- 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &all_data);
- 	if (opt_proxy) {
- 		curl_easy_setopt(curl, CURLOPT_PROXY, opt_proxy);
-@@ -1365,328 +1394,374 @@ inline double nbits_to_diff( uint32_t nbits )
-          diff = (long double)( (uint128_t)0xffff << ( (-shift_off) *8 ) ) 
-               / (long double)bits;
-       else // ( shift_off > 0 )   // shift > 29
-          diff =   (long double)0xffff
-                 / (long double)( (uint128_t)bits << ( shift_off*8 ) );  
-    }
-    else
-    {  // slow
-       int m;
-       diff = 0.;
-       for ( m = shift; m < 29; m++ )    diff *= 256.0;
-       for ( m = 29; m < shift; m++ )    diff /= 256.0;
-    }
- 
-    if ( opt_debug )
-       applog( LOG_INFO, "nbits %08x: shift %u(%d), bits %06x, diff %8g",
-                          nbits, shift, shift_off, bits, (double)diff );
- 
-    return (double)diff;
- }
+@@ -1385,73 +1416,78 @@ inline double nbits_to_diff( uint32_t nbits )
  
  #ifdef WIN32
  #define socket_blocks() (WSAGetLastError() == WSAEWOULDBLOCK)
@@ -562,7 +798,7 @@ index 65d673f..bb4f403 100644
  	struct timeval tv;
  	fd_set rd;
  
- 	FD_ZERO(&rd);
+@@ -1459,214 +1495,255 @@ static bool socket_full(curl_socket_t sock, int timeout)
  	FD_SET(sock, &rd);
  	tv.tv_sec = timeout;
  	tv.tv_usec = 0;
@@ -919,13 +1155,7 @@ index 65d673f..bb4f403 100644
  
  	arr_val = json_array_get(val, 0);
  	if (!arr_val || !json_is_array(arr_val))
- 		return NULL;
- 	n = (int) json_array_size(arr_val);
- 	for (i = 0; i < n; i++) {
- 		const char *notify;
- 		json_t *arr = json_array_get(arr_val, i);
- 
- 		if (!arr || !json_is_array(arr))
+@@ -1680,57 +1757,71 @@ static const char *get_stratum_session_id(json_t *val)
  			break;
  		notify = json_string_value(json_array_get(arr, 0));
  		if (!notify)
@@ -936,6 +1166,581 @@ index 65d673f..bb4f403 100644
  	return NULL;
  }
  
++#define STRATUM_MAX_JOB_ID 128
++#define STRATUM_MAX_COINBASE_BYTES 65536
++#define STRATUM_MAX_MERKLE_BRANCHES 1024
++#define STRATUM_MAX_XNONCE1_BYTES 64
++
++static bool stratum_hex_field(const char *value, size_t bytes);
++
  static bool stratum_parse_extranonce(struct stratum_ctx *sctx, json_t *params, int pndx)
  {
  	const char* xnonce1;
+-	int xn2_size;
++	json_int_t raw_xn2_size;
++	size_t xnonce1_size;
++	uchar *new_xnonce1;
+ 
+ 	xnonce1 = json_string_value(json_array_get(params, pndx));
+ 	if (!xnonce1) {
+ 		applog(LOG_ERR, "Failed to get extranonce1");
+ 		goto out;
+ 	}
+-	xn2_size = (int) json_integer_value(json_array_get(params, pndx+1));
+-	if (!xn2_size) {
++	if (!json_is_integer(json_array_get(params, pndx+1))) {
+ 		applog(LOG_ERR, "Failed to get extranonce2_size");
+ 		goto out;
+ 	}
+-	if (xn2_size < 2 || xn2_size > 16) {
++	raw_xn2_size = json_integer_value(json_array_get(params, pndx+1));
++	if (raw_xn2_size < 2 || raw_xn2_size > 16) {
+ 		applog(LOG_INFO, "Failed to get valid n2size in parse_extranonce");
+ 		goto out;
+ 	}
+-
+-	pthread_mutex_lock(&sctx->work_lock);
+-	if (sctx->xnonce1)
+-		free(sctx->xnonce1);
+-	sctx->xnonce1_size = strlen(xnonce1) / 2;
+-	sctx->xnonce1 = (uchar*) calloc(1, sctx->xnonce1_size);
+-	if (unlikely(!sctx->xnonce1)) {
+-		applog(LOG_ERR, "Failed to alloc xnonce1");
+-		pthread_mutex_unlock(&sctx->work_lock);
++	xnonce1_size = strlen(xnonce1) / 2;
++	if (xnonce1_size > STRATUM_MAX_XNONCE1_BYTES ||
++	    !stratum_hex_field(xnonce1, xnonce1_size)) {
++		applog(LOG_ERR, "Invalid extranonce1");
++		goto out;
++	}
++	new_xnonce1 = malloc(xnonce1_size ? xnonce1_size : 1);
++	if (!new_xnonce1 || !hex2bin(new_xnonce1, xnonce1, xnonce1_size)) {
++		free(new_xnonce1);
++		applog(LOG_ERR, "Failed to decode extranonce1");
+ 		goto out;
+ 	}
+-	hex2bin(sctx->xnonce1, xnonce1, sctx->xnonce1_size);
+-	sctx->xnonce2_size = xn2_size;
++
++	pthread_mutex_lock(&sctx->work_lock);
++	free(sctx->xnonce1);
++	sctx->xnonce1 = new_xnonce1;
++	sctx->xnonce1_size = xnonce1_size;
++	sctx->xnonce2_size = (size_t)raw_xn2_size;
+ 	pthread_mutex_unlock(&sctx->work_lock);
+ 
+    if ( !opt_quiet ) /* pool dynamic change */
+       applog( LOG_INFO, "Stratum extranonce1 0x%s, extranonce2 size %d",
+-         xnonce1, xn2_size);
++         xnonce1, (int)raw_xn2_size);
+ 
+ 	return true;
+ out:
+ 	return false;
+ }
+ 
+ bool stratum_subscribe(struct stratum_ctx *sctx)
+ {
+ 	char *s, *sret = NULL;
+ 	const char *sid;
+@@ -1926,206 +2017,323 @@ bool stratum_suggest_difficulty( struct stratum_ctx *sctx, double diff )
+    free ( s );
+    return rc;
+ }
+ 
+ 
+ 
+ /**
+  * Extract bloc height     L H... here len=3, height=0x1333e8
+  * "...0000000000ffffffff2703e83313062f503253482f043d61105408"
+  */
++/* A pool can provide a short or malformed coinbase. Scan by index so no
++ * pointer is formed or read beyond the allocation. */
+ static uint32_t getblocheight(struct stratum_ctx *sctx)
+ {
++	const unsigned char *coinbase = sctx->job.coinbase;
++	size_t size = sctx->job.coinbase_size;
++	size_t i, run, height_start, n;
+ 	uint32_t height = 0;
+-	uint8_t hlen = 0, *p, *m;
+-
+-	// find 0xffff tag
+-	p = (uint8_t*) sctx->job.coinbase + 32;
+-   m = p + sctx->job.coinbase_size - 32 - 2;
+-//   m = p + 128;
+-	while (*p != 0xff && p < m) p++;
+-	while (*p == 0xff && p < m) p++;
+-	if (*(p-1) == 0xff && *(p-2) == 0xff) {
+-		p++; hlen = *p;
+-		p++; height = le16dec(p);
+-		p += 2;
+-		switch (hlen) {
+-			case 4:
+-				height += 0x10000UL * le16dec(p);
+-				break;
+-			case 3:
+-				height += 0x10000UL * (*p);
+-				break;
+-		}
++
++	if (!coinbase || size <= 32)
++		return 0;
++	for (i = 32; i < size; i++) {
++		if (coinbase[i] != 0xff)
++			continue;
++		run = i;
++		while (i < size && coinbase[i] == 0xff)
++			i++;
++		/* Upstream's encoding has an intervening tag byte before the
++		 * little-endian height length. */
++		if (i - run < 2 || i + 1 >= size)
++			continue;
++		n = coinbase[i + 1];
++		height_start = i + 2;
++		if (n < 2 || n > 4 || n > size - height_start)
++			continue;
++		for (size_t j = 0; j < n; j++)
++			height |= (uint32_t)coinbase[height_start + j] << (8 * j);
++		return height;
+ 	}
+-	return height;
++	return 0;
++}
++
++static bool stratum_hex_field(const char *value, size_t bytes)
++{
++	size_t i;
++	if (!value || strlen(value) != bytes * 2)
++		return false;
++	for (i = 0; i < bytes * 2; i++)
++		if (!isxdigit((unsigned char)value[i]))
++			return false;
++	return true;
++}
++
++static bool stratum_job_id_valid(const char *id)
++{
++	size_t i, length;
++	if (!id || !(length = strlen(id)) || length > STRATUM_MAX_JOB_ID)
++		return false;
++	for (i = 0; i < length; i++)
++		if ((unsigned char)id[i] < 0x21 || (unsigned char)id[i] > 0x7e)
++			return false;
++	return true;
++}
++
++static void stratum_free_job_payload(struct stratum_job *job)
++{
++	int i;
++	if (job->merkle)
++		for (i = 0; i < job->merkle_buf_size; i++)
++			free(job->merkle[i]);
++	free(job->merkle);
++	free(job->coinbase);
++	free(job->job_id);
++}
++
++/* The supervisor supplies a private inherited pipe. Emit no pool text and
++ * never let an invalid environment variable redirect the write to stdio. */
++void solominer_valid_job_event(void)
++{
++	const char *value = getenv("SOLOMINER_EVENT_FD");
++	char *end;
++	long fd;
++	sigset_t blocked, previous, pending;
++	struct sigaction disposition;
++	bool consume_sigpipe;
++	int received;
++	int flags;
++	ssize_t written;
++	if (!value || !*value)
++		return;
++	for (const char *p = value; *p; p++)
++		if (*p < '0' || *p > '9')
++			return;
++	errno = 0;
++	fd = strtol(value, &end, 10);
++	if (errno || *end || fd < 3 || fd > INT_MAX)
++		return;
++	flags = fcntl((int)fd, F_GETFL);
++	if (flags < 0 || (!(flags & O_NONBLOCK) &&
++	    fcntl((int)fd, F_SETFL, flags | O_NONBLOCK) < 0))
++		return;
++	/* A closed supervisor pipe must not kill the miner through SIGPIPE.
++	 * Block only on this thread, and consume only a signal generated by
++	 * this write, preserving any signal that was already pending. */
++	sigemptyset(&blocked);
++	sigaddset(&blocked, SIGPIPE);
++	if (pthread_sigmask(SIG_BLOCK, &blocked, &previous))
++		return;
++	consume_sigpipe = sigpending(&pending) == 0 &&
++	                  !sigismember(&pending, SIGPIPE) &&
++	                  sigaction(SIGPIPE, NULL, &disposition) == 0 &&
++	                  disposition.sa_handler != SIG_IGN;
++	do {
++		written = write((int)fd, "J", 1);
++	} while (written < 0 && errno == EINTR);
++	if (written < 0 && errno == EPIPE && consume_sigpipe)
++		(void)sigwait(&blocked, &received);
++	(void)pthread_sigmask(SIG_SETMASK, &previous, NULL);
+ }
+ 
+ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
+ {
+ 	const char *job_id, *prevhash, *coinb1, *coinb2, *version, *nbits, *stime;
+    const char *finalsaplinghash = NULL;
+    const char *denom10 = NULL, *denom100 = NULL, *denom1000 = NULL,
+               *denom10000 = NULL, *prooffullnode = NULL;
+    const char *extradata = NULL;
+-	size_t coinb1_size, coinb2_size;
++	size_t coinb1_size, coinb2_size, coinbase_size, branch_count;
+ 	bool clean, ret = false;
+ 	int merkle_count, i, p = 0;
+ 	json_t *merkle_arr;
+-	uchar **merkle = NULL;
++	struct stratum_job candidate = {0}, old_job;
+ 	int jsize = json_array_size(params);
+    bool has_claim = ( opt_algo == ALGO_LBRY ) && ( jsize == 10 );
+    bool has_roots = ( opt_algo == ALGO_PHI2 ) && ( jsize == 10 );
+    bool is_veil  = ( opt_algo == ALGO_X16RT_VEIL );
+ 
+    job_id = json_string_value(json_array_get(params, p++));
+ 	prevhash = json_string_value(json_array_get(params, p++));
+    if ( has_claim )
+    {
+        extradata = json_string_value(json_array_get(params, p++));
+        if ( !extradata || strlen( extradata ) != 64 ) 
+        {
+            applog(LOG_ERR, "Stratum notify: invalid claim parameter");
+            goto out;
+        }
+    }
+    else if ( has_roots )
+    {
+        extradata = json_string_value(json_array_get(params, p++));
+        if ( !extradata || strlen( extradata ) != 128 )
+        {
+            applog(LOG_ERR, "Stratum notify: invalid UTXO root parameter");
+            goto out;
+        }
+    }
+    if ( is_veil )
+    {
+       denom10 = json_string_value(json_array_get(params, p++));
+       denom100 = json_string_value(json_array_get(params, p++));
+       denom1000 = json_string_value(json_array_get(params, p++));
+       denom10000 = json_string_value(json_array_get(params, p++));
+       prooffullnode = json_string_value(json_array_get(params, p++));
+    }
+ 
+ 	coinb1 = json_string_value(json_array_get(params, p++));
+ 	coinb2 = json_string_value(json_array_get(params, p++));
+ 	merkle_arr = json_array_get(params, p++);
+ 	if (!merkle_arr || !json_is_array(merkle_arr))
+ 		goto out;
+-	merkle_count = (int) json_array_size(merkle_arr);
++	branch_count = json_array_size(merkle_arr);
++	if (branch_count > STRATUM_MAX_MERKLE_BRANCHES)
++		goto out;
++	merkle_count = (int)branch_count;
+ 	version = json_string_value(json_array_get(params, p++));
+ 	nbits = json_string_value(json_array_get(params, p++));
+ 	stime = json_string_value(json_array_get(params, p++));
++	if (!json_is_boolean(json_array_get(params, p)))
++		goto out;
+ 	clean = json_is_true(json_array_get(params, p)); p++;
+    
+-	if (!job_id || !prevhash || !coinb1 || !coinb2 || !version || !nbits || !stime ||
+-	    strlen(prevhash) != 64 || strlen(version) != 8 ||
+-	    strlen(nbits) != 8 || strlen(stime) != 8) {
++	if (!stratum_job_id_valid(job_id) ||
++	    !stratum_hex_field(prevhash, 32) ||
++	    !stratum_hex_field(version, 4) ||
++	    !stratum_hex_field(nbits, 4) ||
++	    !stratum_hex_field(stime, 4) || !coinb1 || !coinb2) {
+ 		applog(LOG_ERR, "Stratum notify: invalid parameters");
+ 		goto out;
+ 	}
+-
+-   hex2bin( sctx->job.version, version, 4 );
++	coinb1_size = strlen(coinb1) / 2;
++	coinb2_size = strlen(coinb2) / 2;
++	if (coinb1_size > STRATUM_MAX_COINBASE_BYTES ||
++	    coinb2_size > STRATUM_MAX_COINBASE_BYTES ||
++	    !stratum_hex_field(coinb1, coinb1_size) ||
++	    !stratum_hex_field(coinb2, coinb2_size))
++		goto out;
+ 
+    if ( opt_sapling )
+    {
+       finalsaplinghash = json_string_value( json_array_get( params, 9 ) );
+-      if ( !finalsaplinghash || strlen(finalsaplinghash) != 64 )
++      if ( !stratum_hex_field(finalsaplinghash, 32) )
+       {
+          applog( LOG_ERR, "Stratum notify: invalid sapling parameters" );
+          goto out;
+       }
+    }
+    
+    if ( is_veil )
+    {
+-      if ( !denom10 || !denom100 || !denom1000 || !denom10000
+-        || !prooffullnode || strlen(denom10) != 64 || strlen(denom100) != 64
+-        || strlen(denom1000) != 64 || strlen(denom10000) != 64
+-        || strlen(prooffullnode) != 64 )
++      if ( !stratum_hex_field(denom10, 32) ||
++           !stratum_hex_field(denom100, 32) ||
++           !stratum_hex_field(denom1000, 32) ||
++           !stratum_hex_field(denom10000, 32) ||
++           !stratum_hex_field(prooffullnode, 32) )
+       {
+          applog(LOG_ERR, "Stratum notify: invalid veil parameters");
+          goto out;
+       }
+    }
+ 
+-   pthread_mutex_lock( &sctx->work_lock );
+-
+-   if ( merkle_count )
+-   {
+-      if ( merkle_count > sctx->job.merkle_buf_size )
+-      {
+-         for ( i = 0; i < sctx->job.merkle_count; i++ )
+-            free( sctx->job.merkle[i] );
+-         free( sctx->job.merkle );
+-
+-         merkle = (uchar**) malloc( merkle_count * sizeof(char *) );
+-         for ( i = 0; i < merkle_count; i++ )
+-            merkle[i] = (uchar*) malloc( 32 );
+-         sctx->job.merkle_buf_size = merkle_count;
+-         sctx->job.merkle = merkle;
+-      }
+-
+-      for ( i = 0; i < merkle_count; i++ )
+-      {
+-         const char *s = json_string_value( json_array_get( merkle_arr, i ) );
+-         if ( !s || strlen(s) != 64 )
+-         {
+-            sctx->job.merkle_count = 0;
+-            pthread_mutex_unlock( &sctx->work_lock );
+-            applog( LOG_ERR, "Stratum notify: invalid Merkle branch" );
+-            goto out;
+-         }
+-         hex2bin( sctx->job.merkle[i], s, 32 );
+-      }   
+-   }
+-   sctx->job.merkle_count = merkle_count;         
+-
+-	coinb1_size = strlen( coinb1 ) / 2;
+-	coinb2_size = strlen( coinb2 ) / 2;
+-	sctx->job.coinbase_size = coinb1_size + sctx->xnonce1_size +
+-	                          sctx->xnonce2_size + coinb2_size;
+-	sctx->job.coinbase = (uchar*) realloc( sctx->job.coinbase,
+-                                          sctx->job.coinbase_size );
+-	sctx->job.xnonce2 = sctx->job.coinbase + coinb1_size + sctx->xnonce1_size;
+-	hex2bin( sctx->job.coinbase, coinb1, coinb1_size );
+-	memcpy( sctx->job.coinbase + coinb1_size,
+-           sctx->xnonce1, sctx->xnonce1_size );
+-	if ( !sctx->job.job_id || strcmp( sctx->job.job_id, job_id ) )
+-		memset(sctx->job.xnonce2, 0, sctx->xnonce2_size);
+-	hex2bin( sctx->job.xnonce2 + sctx->xnonce2_size, coinb2, coinb2_size );
+-	free( sctx->job.job_id );
+-	sctx->job.job_id = strdup( job_id );
+-	hex2bin( sctx->job.prevhash, prevhash, 32 );
+-   if ( has_claim ) hex2bin( sctx->job.extra, extradata, 32 );
+-   if ( has_roots ) hex2bin( sctx->job.extra, extradata, 64 );
+-   if ( opt_sapling )
+-      hex2bin( sctx->job.final_sapling_hash, finalsaplinghash, 32 );
+-
+-   if ( is_veil )
+-   {
+-      hex2bin( sctx->job.denom10, denom10, 32 );
+-      hex2bin( sctx->job.denom100, denom100, 32 );
+-      hex2bin( sctx->job.denom1000, denom1000, 32 );
+-      hex2bin( sctx->job.denom10000, denom10000, 32 );
+-      hex2bin( sctx->job.proofoffullnode, prooffullnode, 32 );
+-   }
+-
+-	sctx->block_height = getblocheight( sctx );
+-	hex2bin( sctx->job.nbits, nbits, 4 );
+-	hex2bin( sctx->job.ntime, stime, 4 );
+-	sctx->job.clean = clean;
+-	sctx->job.diff = sctx->next_diff;
+-
+-	pthread_mutex_unlock( &sctx->work_lock );
++	for (i = 0; i < merkle_count; i++) {
++		const char *s = json_string_value(json_array_get(merkle_arr, i));
++		if (!stratum_hex_field(s, 32)) {
++			applog(LOG_ERR, "Stratum notify: invalid Merkle branch");
++			goto out;
++		}
++	}
++	if (has_claim && !stratum_hex_field(extradata, 32))
++		goto out;
++	if (has_roots && !stratum_hex_field(extradata, 64))
++		goto out;
+ 
++	pthread_mutex_lock(&sctx->work_lock);
++	if (sctx->xnonce1_size > STRATUM_MAX_XNONCE1_BYTES ||
++	    (sctx->xnonce1_size && !sctx->xnonce1) ||
++	    sctx->xnonce2_size < 2 || sctx->xnonce2_size > 16 ||
++	    coinb1_size + coinb2_size > STRATUM_MAX_COINBASE_BYTES -
++	    sctx->xnonce1_size - sctx->xnonce2_size) {
++		pthread_mutex_unlock(&sctx->work_lock);
++		goto out;
++	}
++	coinbase_size = coinb1_size + sctx->xnonce1_size +
++	                sctx->xnonce2_size + coinb2_size;
++	if (coinbase_size < 32) {
++		pthread_mutex_unlock(&sctx->work_lock);
++		goto out;
++	}
++	candidate.job_id = strdup(job_id);
++	candidate.coinbase = malloc(coinbase_size);
++	candidate.coinbase_size = coinbase_size;
++	candidate.merkle_count = merkle_count;
++	candidate.merkle_buf_size = merkle_count;
++	if (merkle_count)
++		candidate.merkle = calloc(merkle_count, sizeof(*candidate.merkle));
++	if (!candidate.job_id || !candidate.coinbase ||
++	    (merkle_count && !candidate.merkle))
++		goto allocation_failed;
++	for (i = 0; i < merkle_count; i++) {
++		candidate.merkle[i] = malloc(32);
++		if (!candidate.merkle[i])
++			goto allocation_failed;
++		/* All branch strings were validated before this lock. */
++		hex2bin(candidate.merkle[i],
++		        json_string_value(json_array_get(merkle_arr, i)), 32);
++	}
++	if ((coinb1_size && !hex2bin(candidate.coinbase, coinb1, coinb1_size)) ||
++	    (coinb2_size &&
++	     !hex2bin(candidate.coinbase + coinb1_size + sctx->xnonce1_size +
++	              sctx->xnonce2_size, coinb2, coinb2_size)))
++		goto allocation_failed;
++	if (sctx->xnonce1_size)
++		memcpy(candidate.coinbase + coinb1_size, sctx->xnonce1,
++		       sctx->xnonce1_size);
++	candidate.xnonce2 = candidate.coinbase + coinb1_size + sctx->xnonce1_size;
++	candidate.xnonce2_size = sctx->xnonce2_size;
++	if (sctx->job.job_id && !strcmp(sctx->job.job_id, job_id) &&
++	    sctx->job.xnonce2 &&
++	    sctx->job.xnonce2_size == candidate.xnonce2_size)
++		memcpy(candidate.xnonce2, sctx->job.xnonce2,
++		       candidate.xnonce2_size);
++	else
++		memset(candidate.xnonce2, 0, candidate.xnonce2_size);
++	hex2bin(candidate.prevhash, prevhash, 32);
++	hex2bin(candidate.version, version, 4);
++	hex2bin(candidate.nbits, nbits, 4);
++	hex2bin(candidate.ntime, stime, 4);
++	if (has_claim) hex2bin(candidate.extra, extradata, 32);
++	if (has_roots) hex2bin(candidate.extra, extradata, 64);
++	if (opt_sapling)
++		hex2bin(candidate.final_sapling_hash, finalsaplinghash, 32);
++	if (is_veil) {
++		hex2bin(candidate.denom10, denom10, 32);
++		hex2bin(candidate.denom100, denom100, 32);
++		hex2bin(candidate.denom1000, denom1000, 32);
++		hex2bin(candidate.denom10000, denom10000, 32);
++		hex2bin(candidate.proofoffullnode, prooffullnode, 32);
++	}
++	candidate.clean = clean;
++	candidate.diff = sctx->next_diff;
++	old_job = sctx->job;
++	sctx->job = candidate;
++	sctx->block_height = getblocheight(sctx);
++	sctx->new_job = true;
++	pthread_mutex_unlock(&sctx->work_lock);
++	stratum_free_job_payload(&old_job);
+ 	ret = true;
++	goto out;
++
++allocation_failed:
++	pthread_mutex_unlock(&sctx->work_lock);
++	stratum_free_job_payload(&candidate);
++	applog(LOG_ERR, "Stratum notify: insufficient memory for job");
+ 
+ out:
+ 	return ret;
+ }
+ 
+ static bool stratum_set_difficulty(struct stratum_ctx *sctx, json_t *params)
+ {
+ 	double diff;
+ 
+ 	diff = json_number_value(json_array_get(params, 0));
+@@ -2412,68 +2620,71 @@ static bool stratum_show_message(struct stratum_ctx *sctx, json_t *id, json_t *p
+ bool stratum_handle_method(struct stratum_ctx *sctx, const char *s)
+ {
+ 	json_t *val, *id, *params;
+ 	json_error_t err;
+ 	const char *method;
+ 	bool ret = false;
+ 
+ 	val = JSON_LOADS(s, &err);
+ 	if (!val) {
+ 		applog(LOG_ERR, "JSON decode failed(%d): %s", err.line, err.text);
+ 		goto out;
+ 	}
+ 
+ 	method = json_string_value(json_object_get(val, "method"));
+ 	if (!method)
+ 		goto out;
+ 
+ 	params = json_object_get(val, "params");
+ 
+ 	id = json_object_get(val, "id");
+ 
+ 	if (!strcasecmp(method, "mining.notify")) {
+-		ret = stratum_notify(sctx, params);
+-      sctx->new_job = true;
++		/* A malformed notification is still a handled method. Do not
++		 * reinterpret it as a share response in the caller. */
++		if (!stratum_notify(sctx, params))
++			applog(LOG_ERR, "Rejected invalid Stratum job");
++		ret = true;
+       goto out;
+ 	}
+ 	if (!strcasecmp(method, "mining.ping")) { // cgminer 4.7.1+
+ 		if (opt_debug) applog(LOG_DEBUG, "Pool ping");
+ 		ret = stratum_pong(sctx, id);
+ 		goto out;
+ 	}
+ 	if (!strcasecmp(method, "mining.set_difficulty")) {
+ 		ret = stratum_set_difficulty(sctx, params);
+ 		goto out;
+ 	}
+ 	if (!strcasecmp(method, "mining.set_extranonce")) {
+ 		ret = stratum_parse_extranonce(sctx, params, 0);
+ 		goto out;
+ 	}
+ 	if (!strcasecmp(method, "client.reconnect")) {
+ 		ret = stratum_reconnect(sctx, params);
+ 		goto out;
+ 	}
+ 	if (!strcasecmp(method, "client.get_algo")) {
+ 		// will prevent wrong algo parameters on a pool, will be used as test on rejects
+ 		if (!opt_quiet) applog(LOG_NOTICE, "Pool asked your algo parameter");
+ 		ret = stratum_get_algo(sctx, id, params);
+ 		goto out;
+ 	}
+ 	if (!strcasecmp(method, "client.get_stats")) {
+ 		// optional to fill device benchmarks
+ 		ret = stratum_get_stats(sctx, id, params);
+ 		goto out;
+ 	}
+ 	if (!strcasecmp(method, "client.get_version")) {
+ 		ret = stratum_get_version(sctx, id);
+ 		goto out;
+ 	}
+ 	if (!strcasecmp(method, "client.show_message")) {
+ 		ret = stratum_show_message(sctx, id, params);
+ 		goto out;
+ 	}
+ 
+ 	if (!ret) {
+ 		// don't fail = disconnect stratum on unknown (and optional?) methods
+ 		if (opt_debug) applog(LOG_WARNING, "unknown stratum method %s!", method);
+ 		ret = stratum_unknown_method(sctx, id);
+ 	}

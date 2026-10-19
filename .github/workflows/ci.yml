@@ -2,9 +2,14 @@ name: Security and build checks
 
 on:
   push:
-    branches: [main, codex/security-hardening]
+    branches: [main, codex/security-hardening, codex/solominer-hardening]
   pull_request:
   workflow_dispatch:
+    inputs:
+      fedora_vm:
+        description: Run the destructive lifecycle fixture on a disposable Fedora VM runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,8 +30,8 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Shell syntax and lint
         run: |
-          bash -n scripts/*.sh
-          shellcheck scripts/*.sh
+          bash -n scripts/*.sh tests/fedora_acceptance.sh
+          shellcheck scripts/*.sh tests/fedora_acceptance.sh
       - name: Actual systemd isolation and recovery (harmless fixture only)
         run: sudo env CI=true python3 tests/systemd_integration.py
       - name: Compile Python modules
@@ -41,7 +46,7 @@ jobs:
     steps:
       - name: Install CI build prerequisites
         run: >-
-          dnf -y install git gcc gcc-c++ libasan libubsan make autoconf automake libtool
+          dnf -y install git gcc gcc-c++ binutils libasan libubsan make autoconf automake libtool
           pkgconf-pkg-config libcurl-devel jansson-devel gmp-devel zlib-devel
           openssl-devel python3 patch systemd util-linux shadow-utils tar gzip findutils diffutils
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -68,15 +73,15 @@ jobs:
         run: |
           set -euo pipefail
           install -o ci-builder -g ci-builder -m 0600 patches/cpuminer-opt-v26.1-security.patch /tmp/cpuminer-ci-security.patch
+          install -m 0444 scripts/build-miner.sh /tmp/cpuminer-ci-build.sh
           runuser -u ci-builder -- bash -euo pipefail -c '
             cd /tmp/cpuminer-ci
             test "$(id -u)" -ne 0
             git apply --check /tmp/cpuminer-ci-security.patch
             git apply /tmp/cpuminer-ci-security.patch
-            ./autogen.sh
-            CFLAGS="-O2 -march=native -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE" LDFLAGS="-Wl,-z,relro,-z,now -pie" ./configure --with-curl
-            make -j2
+            CFLAGS="-O2 -march=native -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE" LDFLAGS="-Wl,-z,relro,-z,now -pie" bash /tmp/cpuminer-ci-build.sh
             test -f cpuminer
+            readelf -d cpuminer | grep -Eq "NEEDED.*libjansson[.]so"
             ./cpuminer --version
           '
       - name: Verify systemd unit syntax (no service start)
@@ -86,3 +91,16 @@ jobs:
           useradd --system --no-create-home --shell /sbin/nologin solominer
           install -D -m 0755 scripts/solominer /usr/local/bin/solominer
           systemd-analyze verify systemd/btc-solo-cpu.service systemd/solominer-health.service systemd/solominer-health.timer
+
+  fedora-systemd-selinux-acceptance:
+    # GitHub-hosted Fedora is not available. This job requires a one-job, disposable
+    # Fedora VM registered with the custom labels below; it never runs for PRs.
+    if: github.event_name == 'workflow_dispatch' && inputs.fedora_vm == true
+    runs-on: [self-hosted, linux, x64, fedora, disposable]
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Exercise real systemd units under enforcing SELinux (harmless fixture)
+        run: sudo env CI=true SOLOMINER_DISPOSABLE_VM=1 bash tests/fedora_acceptance.sh

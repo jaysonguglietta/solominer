@@ -8,6 +8,7 @@ import grp
 import json
 import os
 from pathlib import Path
+import platform
 import pwd
 import re
 import shutil
@@ -16,7 +17,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from .config import DEFAULT_CONFIG, load_config
+from .config import ConfigError, DEFAULT_CONFIG, load_config, parse_config
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_REPO = "https://github.com/JayDDee/cpuminer-opt.git"
@@ -37,8 +38,10 @@ TARGETS = {"binary": INSTALL_DIR / "cpuminer", "metadata": INSTALL_DIR / "instal
            "health_service": UNIT_DIR / "solominer-health.service",
            "health_timer": UNIT_DIR / HEALTH_TIMER, "resources": RESOURCE_PATH}
 DEPS = ["git", "gcc", "gcc-c++", "make", "automake", "autoconf", "libtool",
-        "libcurl-devel", "jansson-devel", "gmp-devel", "zlib-devel", "openssl-devel",
+        "libcurl-devel", "jansson-devel", "pkgconf-pkg-config", "binutils",
+        "gmp-devel", "zlib-devel", "openssl-devel",
         "lm_sensors", "python3", "patch", "util-linux", "systemd"]
+MIN_BUILD_FREE_BYTES = 1024 ** 3
 
 class AdminError(RuntimeError):
     """Recoverable administrative error."""
@@ -56,9 +59,13 @@ def require_host():
         raise AdminError("Run this administrative command with sudo.")
     if not Path("/etc/fedora-release").is_file():
         raise AdminError("Installation and updates require Fedora with a running systemd manager.")
+    if Path("/run/ostree-booted").exists():
+        raise AdminError("Fedora Atomic/rpm-ostree hosts are not supported by this installer; "
+                         "use a traditional Fedora installation. No system changes were made.")
 
 def require_commands():
-    for name in ("git", "runuser", "systemctl", "systemd-run", "systemd-analyze", "make", "gcc", "autoreconf"):
+    for name in ("git", "systemctl", "systemd-run", "systemd-analyze", "make", "gcc",
+                 "autoreconf", "pkg-config", "readelf"):
         if shutil.which(name) is None:
             raise AdminError(f"Missing {name}; use --install-deps to install prerequisites.")
     if not Path("/run/systemd/system").is_dir():
@@ -125,6 +132,12 @@ def read_regular(path: Path, limit=128 * 1024 * 1024):
     finally:
         os.close(fd)
 
+def config_from_data(data: bytes):
+    try:
+        return parse_config(data.decode('utf-8'), DEFAULT_CONFIG)
+    except UnicodeError as error:
+        raise ConfigError("Configuration must be UTF-8 text.") from error
+
 @contextlib.contextmanager
 def update_lock():
     secure_dir(Path("/run/solominer-admin"), 0o700)
@@ -187,32 +200,50 @@ def check_update():
             "update_available": any(installed.get(key) != value for key, value in expected.items()),
             "note": "Compares this checkout with installed provenance; never automatically adopts upstream code."}
 
-def builder_command(argv, workspace: Path):
-    return ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
+def builder_command(argv, workspace: Path, *, network=False):
+    """Run builder-controlled code in a bounded service; only an explicit fetch gets network."""
+    options = ["systemd-run", "--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
             "--uid=solominer-build", "--gid=solominer-build", f"--working-directory={workspace / 'source'}",
             "--property=NoNewPrivileges=yes", "--property=ProtectSystem=strict", "--property=ProtectHome=yes",
-            "--property=PrivateTmp=yes", "--property=PrivateNetwork=yes", "--property=PrivateDevices=yes",
+            "--property=PrivateDevices=yes", "--property=InaccessiblePaths=/var/tmp",
             "--property=CapabilityBoundingSet=", "--property=ProtectKernelTunables=yes",
             "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
             "--property=RestrictSUIDSGID=yes", "--property=KillMode=control-group",
-            "--property=RuntimeMaxSec=30min", "--property=MemoryMax=2G", "--property=CPUQuota=200%",
+            "--property=RuntimeMaxSec=30min", "--property=MemoryMax=2G",
+            "--property=MemorySwapMax=512M", "--property=TasksMax=256", "--property=CPUQuota=200%",
+            "--property=TemporaryFileSystem=/tmp:rw,size=512M,mode=1777",
             f"--property=ReadWritePaths={workspace}", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
-            f"HOME={workspace / 'home'}", "LANG=C", "CFLAGS=-O2 -march=native -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE",
+            f"HOME={workspace / 'home'}", "TMPDIR=/tmp", "LANG=C",
+            "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0",
+            "CFLAGS=-O2 -march=native -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE",
             "LDFLAGS=-Wl,-z,relro,-z,now -pie", *map(str, argv)]
+    if not network:
+        options.insert(options.index("--property=PrivateDevices=yes"), "--property=PrivateNetwork=yes")
+    return options
 
-def run_builder(argv, workspace, timeout):
-    unit = "solominer-build-" + uuid.uuid4().hex
-    args = builder_command(argv, workspace)
+def run_builder(argv, workspace, timeout, *, network=False, capture=False, input=None):
+    unit = ("solominer-fetch-" if network else "solominer-build-") + uuid.uuid4().hex
+    args = builder_command(argv, workspace, network=network)
     args.insert(1, f"--unit={unit}")
     try:
-        command(args, timeout=timeout)
+        return command(args, timeout=timeout, capture=capture, input=input)
     finally:
-        # systemd-run interruption must not leave a build alive after cleanup.
+        # Interrupted systemd-run must not leave acquisition or a build alive after cleanup.
         command(["systemctl", "stop", unit], check=False, capture=True)
+
+def needed_libraries(binary: Path, workspace: Path):
+    """Inspect ELF metadata inside the sandbox without invoking the dynamic loader."""
+    output = run_builder(["readelf", "-W", "-d", str(binary)], workspace, 60, capture=True).stdout
+    libraries = sorted(set(re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", output)))
+    if not any(re.fullmatch(r"libjansson\.so(?:\.\d+)*", library) for library in libraries):
+        raise AdminError("Built miner is not dynamically linked to Fedora's system Jansson library.")
+    return libraries
 
 @contextlib.contextmanager
 def built_candidate():
     secure_dir(BUILDER_ROOT)
+    if shutil.disk_usage(BUILDER_ROOT).free < MIN_BUILD_FREE_BYTES:
+        raise AdminError("At least 1 GiB of free space is required in the SoloMiner build filesystem.")
     account = pwd.getpwnam("solominer-build")
     with tempfile.TemporaryDirectory(prefix="build-", dir=BUILDER_ROOT) as directory:
         workspace = Path(directory)
@@ -221,14 +252,16 @@ def built_candidate():
         home.mkdir(mode=0o700)
         os.chown(home, account.pw_uid, account.pw_gid)
         source = workspace / "source"
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "LANG": "C", "GIT_CONFIG_NOSYSTEM": "1"}
-        def git(*args, input=None, capture=False):
-            return command(["runuser", "-u", "solominer-build", "--", "git", "-c", "core.hooksPath=/dev/null",
-                            "-c", "protocol.file.allow=never", "-c", "protocol.ext.allow=never", *args],
-                           env=env, input=input, capture=capture, timeout=600)
+        source.mkdir(mode=0o700)
+        os.chown(source, account.pw_uid, account.pw_gid)
+        def git(*args, input=None, capture=False, network=False):
+            return run_builder(["git", "-c", "core.hooksPath=/dev/null",
+                                "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", *args],
+                               workspace, timeout=600, input=input, capture=capture, network=network)
         print(f"Fetching approved {UPSTREAM_VERSION} source as solominer-build...", flush=True)
         git("init", "--quiet", str(source))
-        git("-C", str(source), "fetch", "--quiet", "--depth=1", UPSTREAM_REPO, UPSTREAM_REVISION)
+        git("-C", str(source), "fetch", "--quiet", "--depth=1", UPSTREAM_REPO, UPSTREAM_REVISION,
+            network=True)
         git("-C", str(source), "checkout", "--quiet", "--detach", "FETCH_HEAD")
         revision = git("-C", str(source), "rev-parse", "HEAD", capture=True).stdout.strip()
         if revision != UPSTREAM_REVISION:
@@ -245,10 +278,17 @@ def built_candidate():
         data = read_regular(binary)
         if not data.startswith(b"\x7fELF"):
             raise AdminError("Build did not produce a regular ELF executable.")
+        libraries = needed_libraries(binary, workspace)
         run_builder([binary, "--version"], workspace, timeout=60)
+        fedora = platform.freedesktop_os_release()
         metadata = {"upstream_version": UPSTREAM_VERSION, "revision": revision,
                     "sha256": hashlib.sha256(data).hexdigest(), "patch_sha256": patch_digest(),
-                    "control_digest": bundle_digest(), "installed_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+                    "control_digest": bundle_digest(), "installed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "fedora_release": fedora.get("PRETTY_NAME", "Fedora"), "fedora_version": fedora.get("VERSION_ID"),
+                    "architecture": platform.machine(),
+                    "compiler": run_builder(["gcc", "-dumpfullversion", "-dumpversion"],
+                                            workspace, 60, capture=True).stdout.strip(),
+                    "linked_libraries": libraries}
         yield data, metadata
 
 def install_bundle():
@@ -362,11 +402,34 @@ def write_units(config):
     command(["systemd-analyze", "verify", str(UNIT_DIR / SERVICE), str(UNIT_DIR / "solominer-health.service"),
              str(UNIT_DIR / HEALTH_TIMER)])
 
+def restore_record(path, prior):
+    if prior is None:
+        path.unlink(missing_ok=True)
+    else:
+        atomic_write(path, prior, 0o600)
+
+def recovery_errors(steps):
+    """Attempt every recovery step, including release restore after disk errors."""
+    failures = []
+    for label, action in steps:
+        try:
+            action()
+        except BaseException as error:
+            failures.append(f"{label}: {error}")
+    return failures
+
 def activate(data, metadata, config):
     secure_install_dir()
+    expected_config = read_regular(DEFAULT_CONFIG, 65536)
+    if config_from_data(expected_config) != config or read_regular(DEFAULT_CONFIG, 65536) != expected_config:
+        raise AdminError("Configuration changed during the build; validate it and retry before downtime.")
+    good_path = ADMIN_DIR / "last-good-config"
+    backup_path = ADMIN_DIR / "last-backup"
+    prior_good = read_regular(good_path, 65536) if good_path.exists() else None
+    prior_backup = read_regular(backup_path, 256) if backup_path.exists() else None
     backup_id = snapshot(unit_states())
-    stop_units()
     try:
+        stop_units()
         atomic_write(INSTALL_DIR / "cpuminer", data, 0o755)
         atomic_write(INSTALL_DIR / "install.json", json.dumps(metadata, indent=2).encode())
         install_bundle()
@@ -376,10 +439,19 @@ def activate(data, metadata, config):
         command(["systemctl", "restart", SERVICE])
         verify_started()
         command(["systemctl", "enable", "--now", HEALTH_TIMER])
-    except BaseException:
-        restore_backup(backup_id)
+        if read_regular(DEFAULT_CONFIG, 65536) != expected_config:
+            raise AdminError("Configuration changed during activation; restoring prior release.")
+        atomic_write(good_path, expected_config, 0o600)
+        atomic_write(backup_path, backup_id.encode(), 0o600)
+    except BaseException as error:
+        failures = recovery_errors([
+            ("release restore", lambda: restore_backup(backup_id)),
+            ("configuration record restore", lambda: restore_record(good_path, prior_good)),
+            ("backup pointer restore", lambda: restore_record(backup_path, prior_backup)),
+        ])
+        if failures:
+            raise AdminError("Activation failed and recovery is incomplete: " + "; ".join(failures)) from error
         raise
-    atomic_write(ADMIN_DIR / "last-backup", backup_id.encode(), 0o600)
     print(f"Installed patched {UPSTREAM_VERSION} ({UPSTREAM_REVISION[:12]}).")
     print("Startup was stable. Run sudo /usr/local/bin/solominer doctor for pool and sensor checks.")
 
@@ -445,23 +517,90 @@ def rollback():
         atomic_write(ADMIN_DIR / "last-backup", current.encode(), 0o600)
         print(f"Restored backup {backup_id}; wallet configuration was preserved.")
 
-def apply_config():
-    """Apply validated resource and mining settings without rebuilding native code."""
+def apply_config(source=None):
+    """Apply a candidate atomically and restore the last working config on failure."""
     require_host()
     with update_lock():
-        config = prepare_config(migrate=True)
+        secure_dir(ADMIN_DIR, 0o700)
+        if not DEFAULT_CONFIG.exists() or DEFAULT_CONFIG.is_symlink():
+            raise AdminError("A regular /etc/sysconfig/btc-solo-cpu must exist before applying settings.")
+        previous_good_path = ADMIN_DIR / "last-good-config"
+        previous_good = (read_regular(previous_good_path, 65536)
+                         if previous_good_path.exists() else None)
+        source_path = Path(source) if source is not None else DEFAULT_CONFIG
+        if not source_path.is_absolute():
+            raise AdminError("Candidate configuration path must be absolute.")
+        candidate = read_regular(source_path, 65536)
+        try:
+            config = config_from_data(candidate)
+        except ConfigError:
+            if source is None and previous_good is not None:
+                config_from_data(previous_good)
+                rejected = ADMIN_DIR / ("rejected-config-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                                        + "-" + uuid.uuid4().hex[:8])
+                atomic_write(rejected, candidate, 0o600)
+                ensure_users()
+                atomic_write(DEFAULT_CONFIG, previous_good, 0o640, pwd.getpwnam("solominer").pw_gid)
+                if command(["systemctl", "is-failed", "--quiet", SERVICE],
+                           check=False, capture=True).returncode == 0:
+                    try:
+                        command(["systemctl", "restart", SERVICE])
+                        verify_started()
+                    except BaseException as error:
+                        raise AdminError(f"Restored last working configuration, but the failed service did not recover; rejected edit saved at {rejected}. Inspect its journal.") from error
+                raise AdminError(f"Invalid live configuration restored from last known good; rejected edit saved at {rejected}.")
+            raise
+        if source is None and previous_good is None:
+            raise AdminError("No last-known-good configuration is recorded. Run update first or use apply-config --from /absolute/candidate.")
+        ensure_users()
+        current = read_regular(DEFAULT_CONFIG, 65536)
+        if previous_good is None:
+            if source_path == DEFAULT_CONFIG:
+                raise AdminError("No last-known-good configuration is recorded; provide a separate candidate file.")
+            config_from_data(current)
+        else:
+            config_from_data(previous_good)
+        rollback_config = previous_good if previous_good is not None else current
+        backup_path = ADMIN_DIR / "last-backup"
+        prior_backup = read_regular(backup_path, 256) if backup_path.exists() else None
         states = unit_states()
         backup_id = snapshot(states)
-        stop_units()
+        if read_regular(DEFAULT_CONFIG, 65536) != current:
+            raise AdminError("Live configuration changed during validation; retry without concurrent edits.")
         try:
+            stop_units()
+            if read_regular(DEFAULT_CONFIG, 65536) != current:
+                raise AdminError("Live configuration changed during activation; restoring previous release.")
+            atomic_write(DEFAULT_CONFIG, candidate, 0o640, pwd.getpwnam("solominer").pw_gid)
             write_units(config)
             command(["systemctl", "daemon-reload"])
             command(["systemctl", "restart", SERVICE])
             verify_started()
             if states[HEALTH_TIMER]["active"]:
                 command(["systemctl", "start", HEALTH_TIMER])
-        except BaseException:
-            restore_backup(backup_id)
+            if read_regular(DEFAULT_CONFIG, 65536) != candidate:
+                raise AdminError("Live configuration changed during startup; preserving that edit and restoring the previous release.")
+            atomic_write(previous_good_path, candidate, 0o600)
+            atomic_write(backup_path, backup_id.encode(), 0o600)
+        except BaseException as error:
+            failures = []
+            try:
+                live = read_regular(DEFAULT_CONFIG, 65536)
+            except BaseException as read_error:
+                failures.append(f"configuration inspection: {read_error}")
+                live = None
+            steps = []
+            if live == candidate and live != rollback_config:
+                steps.append(("configuration restore", lambda: atomic_write(
+                    DEFAULT_CONFIG, rollback_config, 0o640, pwd.getpwnam("solominer").pw_gid)))
+            steps.extend([
+                ("release restore", lambda: restore_backup(backup_id)),
+                ("configuration record restore", lambda: restore_record(previous_good_path, previous_good)),
+                ("backup pointer restore", lambda: restore_record(backup_path, prior_backup)),
+            ])
+            failures.extend(recovery_errors(steps))
+            if failures:
+                raise AdminError("Configuration activation failed and recovery is incomplete: "
+                                 + "; ".join(failures)) from error
             raise
-        atomic_write(ADMIN_DIR / "last-backup", backup_id.encode(), 0o600)
         print("Validated configuration and resource limits applied; startup was stable.")
