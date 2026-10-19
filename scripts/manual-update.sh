@@ -31,7 +31,9 @@ Usage: sudo /etc/solominer/update.sh [MODE]
   --all SHA            Upgrade Fedora RPMs first, then apply the reviewed SoloMiner SHA
   --help               Show this help
 
-Run --check, review the full diff, then pass its exact SHA to --miner or --all.
+Run --check. For code updates, review the incoming diff or current checkout,
+then use the full lowercase 40-character SHA after "SoloMiner proposed:" with
+--miner or --all. --packages takes no SHA.
 This script does not schedule updates, upgrade Fedora releases, or reboot.
 EOF
 }
