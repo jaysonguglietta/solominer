@@ -49,13 +49,23 @@ The Git checkout and running installation are separate. `/opt/cpuminer-opt` cont
 
    If either the service or configuration is missing, do not run `--migrate`; inspect the existing setup. Follow [First installation](#first-installation) only when this is actually a new install.
 
-2. From the SoloMiner checkout selected in step 1, verify its remote, review local edits, and update `main`. Stop if the remote is the upstream `cpuminer-opt` repository or if `git status` shows changes you have not reviewed. `--ff-only` deliberately stops on divergent history.
+2. From the SoloMiner checkout selected in step 1, verify its remote and local edits, fetch `main`, and review the incoming changes before updating the checkout. Continue only if `git remote get-url origin` prints exactly `https://github.com/jaysonguglietta/solominer.git` and `git status` shows no changes you have not reviewed. Run both blocks in the same shell so `reviewed_sha` remains set.
 
    ```bash
    git remote get-url origin
    git status --short
-   git switch main
-   git pull --ff-only origin main
+   git -c core.hooksPath=/dev/null switch main
+   git -c core.hooksPath=/dev/null fetch --no-tags origin main
+   reviewed_sha=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+   printf 'Reviewing SHA: %s\n' "$reviewed_sha"
+   git --no-pager log --oneline "HEAD..$reviewed_sha"
+   git --no-pager diff --no-ext-diff --no-textconv HEAD "$reviewed_sha"
+   ```
+
+   After reviewing the complete diff, fast-forward to that exact SHA. `--ff-only` deliberately stops on divergent history; disabling checkout hooks prevents the merge from running code from the checkout.
+
+   ```bash
+   git -c core.hooksPath=/dev/null merge --ff-only "$reviewed_sha"
    git log -1 --format='%h %s'
    ```
 
@@ -187,7 +197,7 @@ Use `solominer --help` and `solominer COMMAND --help` for the installed interfac
 | `status` | Service state, release provenance, configured and active pool, timestamp and age of the last validated job, resource use, temperatures, and recent events. |
 | `doctor` | Configuration, permissions, release integrity, effective systemd settings, and sensor diagnostics. |
 | `health` | Local service, validated-job state, and CPU/thermal evaluation; active process and useful work are distinct signals. |
-| `update --check` | Approved pin and installed release; no build or activation and no moving upstream branch. |
+| `update --check` | Compare the installed management bundle's approved source and patch with installed provenance; no Git fetch, build, activation, or RPM update. Use the checkout's update script to check whether newer reviewed checkout contents need activation. |
 | `update` | Install current management code/units, build the approved patched source, record provenance, and activate with startup verification. |
 | `update --no-restart` | Stage only; do not change active release or restart the miner. |
 | `update --activate-staged` | Activate the staged release after checking it matches the current approved source, patch, and management bundle. |
@@ -234,29 +244,59 @@ Install the script once from a checkout whose contents you have reviewed. Run th
 )
 ```
 
-For each maintenance session, start with a non-installing update check. It fetches the repository's `main` branch from its fixed HTTPS URL and reports the complete Git commit ID, incoming commits and change summary, and available Fedora package updates; it does not activate code or install RPMs. It can update the local Git object store and DNF metadata. A bare invocation has the same behavior:
+For each maintenance session, start with a non-installing update check. It fetches the repository's `main` branch from its fixed HTTPS URL and reports the complete Git commit IDs, incoming commits and change summary, and available Fedora package updates; it does not activate code or install RPMs. It can update the local Git object store and DNF metadata. A bare invocation has the same behavior:
 
 ```bash
 sudo /etc/solominer/update.sh --check
 ```
 
-Use the **full 40-character commit ID** printed by `--check` in the next commands, replacing `COMMIT_SHA` below. Run the Git review commands in a root shell. Before a SoloMiner code update, inspect the complete incoming diff and any changes to root-run scripts, the pinned source, patch, service units, and dependency list. The commit ID is an explicit choice of what to install: if `main` moves after the check, the updater stops and asks you to check and review again.
+Read the two lines labeled **`SoloMiner current:`** and **`SoloMiner proposed:`**. The proposed line is the SHA for a code update. It is a full lowercase 40-character Git commit ID; do not type the words `FULL_SHA` or `COMMIT_SHA`. `current` is the checkout's Git commit, not necessarily the release installed and running. If the two Git SHAs match, check the installed release against the **checkout's** approved source, patch, and management content. Run the checkout script and look for its `update_available` result:
 
 ```bash
-git -C /root/solominer --no-pager log --oneline HEAD..COMMIT_SHA
-git -C /root/solominer --no-pager diff --stat --no-ext-diff --no-textconv HEAD COMMIT_SHA
-git -C /root/solominer --no-pager diff --no-ext-diff --no-textconv HEAD COMMIT_SHA
-sudo /etc/solominer/update.sh --miner COMMIT_SHA
+sudo bash /root/solominer/scripts/update-solominer.sh --check
 ```
 
-Choose `--packages` to run `dnf upgrade --refresh` without changing the SoloMiner Git checkout. It requires a terminal and asks you to type `UPGRADE` before invoking DNF. This upgrades eligible RPMs across the **whole Fedora system**, not only SoloMiner prerequisites. Choose `--all COMMIT_SHA` to run that DNF transaction first and then update SoloMiner from the reviewed commit. A failed package transaction stops the combined update before the SoloMiner code step. If the remote `main` moves during the package transaction, the RPMs remain updated and the code step stops until you review the new commit. Neither mode performs a Fedora release upgrade or reboots the machine.
+The installed `/usr/local/bin/solominer update --check` loads the already installed bundle, so it cannot detect a newer checkout after a failed stage, failed activation, or rollback. If `current` and `proposed` match **and** the checkout check reports `"update_available": false`, SoloMiner code is current. To update Fedora RPMs alone, use `--packages`; it needs no SHA. It requires a terminal and asks you to type `UPGRADE` before invoking DNF. This upgrades eligible RPMs across the **whole Fedora system**, not only SoloMiner prerequisites.
 
 ```bash
 sudo /etc/solominer/update.sh --packages
-sudo /etc/solominer/update.sh --all COMMIT_SHA
 ```
 
-The code modes fast-forward the checked-out `main` branch, stage the managed build, activate it, then run `doctor` and `status`. Activation can briefly interrupt mining. The updater script in `/etc` is a separate root-owned copy: a SoloMiner code update does not silently replace it. After reviewing a newer `scripts/manual-update.sh`, repeat the `sudo install -m 0700 ...` command above to refresh the copy.
+If the Git commits differ, or the checkout check reports an update even though Git is current, review and apply the proposed code commit. Open a root shell with `sudo -i` if needed, and keep that same shell for the review and update commands so `proposed_sha` remains set. Read the SHA fetched by `--check` from `FETCH_HEAD`. Confirm the printed value exactly matches **`SoloMiner proposed:`** from the check output. If another fetch changed it, rerun `--check` and review the new result.
+
+```bash
+proposed_sha=$(git -C /root/solominer rev-parse --verify 'FETCH_HEAD^{commit}')
+printf 'Reviewing SoloMiner proposed: %s\n' "$proposed_sha"
+git -C /root/solominer --no-pager log --oneline "HEAD..$proposed_sha"
+git -C /root/solominer --no-pager diff --stat --no-ext-diff --no-textconv HEAD "$proposed_sha"
+git -C /root/solominer --no-pager diff --no-ext-diff --no-textconv HEAD "$proposed_sha"
+```
+
+Stop and inspect the **complete diff** before running either code-update command, especially changes to root-run scripts, the pinned miner source, patch, service units, and dependencies. If Git `current` equals `proposed` but the installed release lags, the diff is empty; inspect the already checked-out code you are about to run. To update SoloMiner **only**, run:
+
+```bash
+sudo /etc/solominer/update.sh --miner "$proposed_sha"
+```
+
+To update Fedora RPMs **and then** SoloMiner, choose this instead:
+
+```bash
+sudo /etc/solominer/update.sh --all "$proposed_sha"
+```
+
+The code modes require the exact proposed SHA and reject a moved `main` branch; rerun `--check` and review a new diff if that happens. They fast-forward the checked-out `main` branch, stage the managed build, activate it, then run `doctor` and `status`. Activation can briefly interrupt mining. A failed package transaction stops `--all` before the SoloMiner code step. If `main` moves during that transaction, the RPMs remain updated but the code step stops. Neither mode performs a Fedora release upgrade or reboots the machine.
+
+The updater script in `/etc` is a separate root-owned copy: a SoloMiner code update does not silently replace it. If a newer `scripts/manual-update.sh` was part of the reviewed update, compare it with the installed copy. A diff exit status of 1 simply means the files differ:
+
+```bash
+sudo diff -u /etc/solominer/update.sh /root/solominer/scripts/manual-update.sh
+```
+
+After reviewing the changed script, explicitly refresh the installed copy:
+
+```bash
+sudo install -m 0700 -o root -g root /root/solominer/scripts/manual-update.sh /etc/solominer/update.sh
+```
 
 Check the service and validated-job timestamp after maintenance. A package update can require an operator-controlled reboot or restart of affected services; SoloMiner rollback does **not** undo Fedora RPM upgrades. If a code activation fails, inspect the output and journal; the managed updater attempts to recover the prior release. If a new SoloMiner release runs but is unsuitable, use `sudo /usr/local/bin/solominer rollback` and verify it again. A rollback does not rewind `/root/solominer`, so review that checkout before a later retry.
 
@@ -311,7 +351,7 @@ Keep SELinux enabled. The installer does not loosen SELinux policy or open firew
 
 **Activation fails:** the updater attempts to restore the previous release. `apply-config --from` also restores the last working configuration after a failed candidate. Inspect `solominer status` and the service journal. If both releases fail, repair configuration/pool access before restarting.
 
-**Manual updater refuses to run:** verify that `/root/solominer` is the clean, root-owned SoloMiner `main` checkout and that its `origin` is the expected repository. If `main` advanced after `--check`, inspect the new diff and use its new full commit ID. Do not bypass ownership, remote, or clean-worktree checks. If DNF fails, resolve the Fedora package error before retrying; SoloMiner rollback cannot restore RPMs.
+**Manual updater refuses to run:** verify that `/root/solominer` is the clean, root-owned SoloMiner `main` checkout and that its `origin` is the expected repository. For `--miner` and `--all`, use the full lowercase 40-character SHA shown after `SoloMiner proposed:` by `/etc/solominer/update.sh --check`; `--packages` takes no SHA. If `main` advanced after the check, inspect the new diff and use its new proposed SHA. Do not bypass ownership, remote, or clean-worktree checks. If DNF fails, resolve the Fedora package error before retrying; SoloMiner rollback cannot restore RPMs. A failed stage or activation can leave the checkout current while the installed release is behind: run `sudo bash /root/solominer/scripts/update-solominer.sh --check`, inspect logs, fix the cause, and retry `--miner` with the same reviewed proposed SHA if `main` has not moved.
 
 **Pool connection or job freshness fails:** verify the provider's current host/port/transport, DNS, outbound firewall, system time, and CA store. Inspect the active pool and last validated job in `solominer status`. Do not disable certificate verification. Local startup success does not prove network connectivity or valid work.
 
