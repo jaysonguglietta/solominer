@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -241,6 +242,41 @@ class RuntimeTests(unittest.TestCase):
         state = json.loads((self.path / 'mining.json').read_text())
         self.assertIsInstance(state['last_job_at'], float)
         self.assertEqual(state['failures'], 1)
+
+    def test_first_valid_job_is_published_while_miner_is_running(self):
+        miner = self.path / 'first-job-miner'
+        miner.write_text('#!/usr/bin/env python3\nimport os, time\n'
+                         'os.write(int(os.environ["SOLOMINER_EVENT_FD"]), b"J")\n'
+                         'time.sleep(30)\n')
+        miner.chmod(0o755)
+        state_path = self.path / 'mining.json'
+        supervisor = ('from pathlib import Path\nimport sys\n'
+                      'from solominer.config import load_config\n'
+                      'from solominer.runtime import _supervise\n'
+                      '_supervise(load_config(Path(sys.argv[1])), Path(sys.argv[2]), Path(sys.argv[3]))\n')
+        process = subprocess.Popen([sys.executable, '-c', supervisor, str(self.config_path),
+                                    str(miner), str(state_path)], cwd=Path(__file__).resolve().parents[1],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            state = {}
+            while time.monotonic() < deadline:
+                if state_path.exists():
+                    state = json.loads(state_path.read_text())
+                    if state.get('last_job_at') is not None:
+                        break
+                time.sleep(0.02)
+            self.assertIsNone(process.poll(), 'Supervisor exited before the first-job check.')
+            self.assertEqual(state.get('status'), 'running')
+            self.assertIsInstance(state.get('last_job_at'), float,
+                                  'First valid job must be persisted before the miner exits.')
+        finally:
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
 
     def test_temperature_enumeration_ignores_gpu(self):
         for number, name, temp in ((0, 'amdgpu', '99000'), (8, 'coretemp', '66000'), (12, 'k10temp', '72000')):
