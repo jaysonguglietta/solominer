@@ -50,6 +50,12 @@ The patch changes `util.c`, `cpu-miner.c`, `miner.h`, and `sysinfos.c`:
   health checks must report that a thermal cutoff cannot protect a machine
   without readable supported CPU sensors.
 
+The SoloMiner supervisor, outside this native patch, persists the first
+delivered `J` event immediately to `/run/solominer/state.json` and throttles
+subsequent state writes. The timestamp shows validated work reached the miner;
+it does not show an accepted share or payout. A dropped event can delay this
+telemetry without invalidating the job.
+
 TLS is enforced only for HTTPS / `stratum+ssl://` / `stratum+tcps://`. Plain
 `stratum+tcp://` remains plaintext; this patch does not invent TLS support for a
 pool that offers only TCP. SoloMiner must require a deliberate insecure transport
@@ -62,6 +68,8 @@ The test suite compiles the actual postimage C functions extracted from this
 patch with synthetic transport, allocator, Stratum JSON, and hwmon fixtures. It
 tests short coinbases, malformed fields, branch resizing, allocation failure,
 and valid-job event emission. It never launches a miner or connects to a pool.
+The Python runtime suite also checks that the first delivered event reaches
+the state file while a harmless fixture process is still running.
 
 ```bash
 SANITIZE=1 python3 -m unittest discover -s tests -v
