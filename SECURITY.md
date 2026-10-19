@@ -24,9 +24,11 @@ Receiving addresses and worker names appear in process arguments and logs. They 
 
 ## Updates and recovery
 
-Updates use a lock, private build workspace, bounded commands, root-owned release storage, binary digests, and provenance metadata. Failed builds leave the active release intact. Files are replaced atomically while the service is stopped; failed startup checks attempt to restore the prior release. Candidate configuration application keeps a last working copy and restores it if startup fails. The complete multi-file activation is not a power-loss transaction. After an interruption or power loss, an administrator should inspect state and logs.
+Keep the SoloMiner Git checkout separate from `/opt/cpuminer-opt`, which may also contain an upstream `cpuminer-opt` checkout. Verify that `git remote get-url origin` identifies `jaysonguglietta/solominer` before pulling or running a root installer. A SoloMiner Git pull only changes the checkout; the installed service changes after an explicit SoloMiner update or migration. An older installation may have no SoloMiner checkout or management CLI, in which case clone the repository separately and validate the existing configuration before `--migrate`. Never treat an upstream `cpuminer-opt` pull as a SoloMiner security update.
 
-Startup verification checks local service execution. It cannot prove honest pool behavior, successful payouts, or future availability. The supervisor records validated-job freshness and changes endpoints after the configured grace period without a valid job. This is a liveness signal, not proof of share credit or payout. Health checks read this structured state and systemd accounting; sensor data has hardware-dependent limits.
+Updates use a lock, private build workspace, bounded commands, root-owned release storage, binary digests, and provenance metadata. Failed builds leave the active release intact. Files are replaced atomically while the service is stopped; failed startup checks attempt to restore the prior release. Candidate configuration application keeps a last working copy and restores it if startup fails. The complete multi-file activation is not a power-loss transaction. After an interruption or power loss, an administrator should inspect state and logs. Keep a root-only copy of the previous configuration before migration or update; rollback preserves the current configuration, which may contain settings an older release cannot use. A rollback to a legacy install may also remove the managed CLI.
+
+Startup verification checks local service execution. It cannot prove honest pool behavior, successful payouts, or future availability. The supervisor persists the first delivered validated-job event immediately, throttles later state writes, and changes endpoints after the configured grace period without a valid job. `Waiting for the first validated Stratum job` is normal briefly after startup but does not prove the pool has provided usable work. Event delivery is best-effort, and job freshness is a liveness signal, not proof of share credit or payout. Health checks read this structured state and systemd accounting; sensor data has hardware-dependent limits.
 
 Imported legacy binaries have unknown provenance and may retain prior defects. Rollback provides recovery, not proof that an older version is secure. Prefer repairing the pinned release over remaining on a legacy binary.
 
@@ -47,7 +49,7 @@ Validate on a disposable Fedora host before relying on unattended operation:
 5. Pool/DNS outage, sleep/resume, crash loops, authentication without valid jobs, sensor loss, temperature warnings, and local alerts.
 6. Effective CPU/memory/swap/task limits, SELinux AVCs, no unexpected listening sockets, current Fedora advisories, and linked-library inventory.
 
-No complete audit of `cpuminer-opt`, Fedora, the kernel, or linked libraries is claimed. The user's running Fedora host was not remotely inspected during this repository update.
+No complete audit of `cpuminer-opt`, Fedora, the kernel, or linked libraries is claimed. Repository and CI checks do not establish the security of a particular running Fedora host.
 
 ## Reporting
 

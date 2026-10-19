@@ -27,57 +27,82 @@ The CI build uses a Fedora 44 container. Validate the real service on the Fedora
 
 The installer can install Fedora build prerequisites with `--install-deps`. It does not upgrade the operating system by default. Continue normal Fedora security maintenance separately.
 
-## Upgrade an existing installation
+## Upgrade or migrate an existing Fedora installation
 
-Run these steps on your Fedora machine, from your existing SoloMiner checkout. The build needs network access to fetch the pinned upstream commit; staging does not stop the running service.
+The Git checkout and running installation are separate. `/opt/cpuminer-opt` contains the upstream miner source and installed binary; its Git remote may be `JayDDee/cpuminer-opt`. **Do not switch branches or pull there to update SoloMiner.** Use a checkout whose remote is `jaysonguglietta/solominer`. An older installation may have no SoloMiner checkout or `/usr/local/bin/solominer` command at all.
 
-1. Record the active version and save your configuration:
+1. Check the existing service and find or create a SoloMiner checkout. If the `find` command prints `/root/solominer/scripts/update-solominer.sh`, for example, the checkout is `/root/solominer` (the directory containing `scripts`). If it prints nothing, clone a fresh copy. Cloning does not change the running service.
 
    ```bash
-   sudo /usr/local/bin/solominer status
-   sudo install -m 0600 -o root -g root /etc/sysconfig/btc-solo-cpu /root/btc-solo-cpu.before-update
+   systemctl show btc-solo-cpu.service -p LoadState -p ActiveState
+   test -f /etc/sysconfig/btc-solo-cpu && echo "Config exists" || echo "Config missing"
+   test -x /usr/local/bin/solominer && echo "Managed command exists" || echo "No managed command"
+   sudo find /root /home /srv /opt -type f -path '*/scripts/update-solominer.sh' -print 2>/dev/null
    ```
 
-   If an older installation lacks the `solominer` command, use `sudo systemctl status btc-solo-cpu.service` for the first check.
-
-2. Update and review the checkout. Save local edits first; `--ff-only` intentionally stops on divergent history:
+   If no checkout was found:
 
    ```bash
-   cd /path/to/solominer
+   git clone https://github.com/jaysonguglietta/solominer.git "$HOME/solominer"
+   cd "$HOME/solominer"
+   ```
+
+   If either the service or configuration is missing, do not run `--migrate`; inspect the existing setup. Follow [First installation](#first-installation) only when this is actually a new install.
+
+2. From the SoloMiner checkout selected in step 1, verify its remote, review local edits, and update `main`. Stop if the remote is the upstream `cpuminer-opt` repository or if `git status` shows changes you have not reviewed. `--ff-only` deliberately stops on divergent history.
+
+   ```bash
+   git remote get-url origin
+   git status --short
    git switch main
-   git pull --ff-only
+   git pull --ff-only origin main
    git log -1 --format='%h %s'
    ```
 
-3. Inspect `/etc/sysconfig/btc-solo-cpu` with `sudoedit`. If the pool URL begins with `stratum+tcp://`, set `ALLOW_INSECURE_POOL=true` **only if you explicitly accept plaintext mining traffic**. The preferred choice is a pool-documented `stratum+ssl://` or `stratum+tcps://` endpoint with `ALLOW_INSECURE_POOL=false`. An older config that relied on the previous implicit plaintext allowance must now state its choice; an existing explicit `true` remains valid. Apply the same policy to every fallback URL.
-
-4. For a previously managed installation, stage, activate, and verify:
+3. Save the existing configuration under a unique root-only filename, then validate it with the new parser **before** migration or activation. Keep the printed backup path for recovery. The validator prints an error without changing the live service.
 
    ```bash
-   sudo bash scripts/update-solominer.sh --check
-   sudo bash scripts/update-solominer.sh --no-restart
-   sudo bash scripts/update-solominer.sh --activate-staged
-   sudo /usr/local/bin/solominer doctor
-   sudo /usr/local/bin/solominer status
-   sudo systemctl status btc-solo-cpu.service solominer-health.timer
+   backup_path="/root/btc-solo-cpu.before-update.$(date -u +%Y%m%dT%H%M%SZ)"
+   sudo install -m 0600 -o root -g root /etc/sysconfig/btc-solo-cpu "$backup_path"
+   printf 'Config backup: %s\n' "$backup_path"
+   sudo python3 -c 'from solominer.config import load_config; load_config("/etc/sysconfig/btc-solo-cpu"); print("Configuration valid")'
    ```
 
-   For the older unmanaged layout, replace the two update commands with `sudo bash scripts/install-solominer.sh --migrate --install-deps`. Migration requires and preserves the existing configuration, installs the managed code and units, and retains an importable old binary for recovery. An imported binary has unknown provenance and lacks the new native fixes.
+   If validation rejects a `stratum+tcp://` pool, use `sudoedit /etc/sysconfig/btc-solo-cpu` to select a **pool-documented** `stratum+ssl://` or `stratum+tcps://` host and port with `ALLOW_INSECURE_POOL=false`, or set `ALLOW_INSECURE_POOL=true` exactly once if you deliberately accept plaintext traffic. Do not guess a TLS port. The same rule applies to fallback pools. Fix any other named validation error and rerun the validator until it prints `Configuration valid`.
 
-5. Watch the local logs and pool dashboard for a valid job and credited work:
+4. Choose the command that matches the current installation:
+
+   - **Managed install** (`/usr/local/bin/solominer` exists): stage and then activate. `--check` compares this checkout with installed provenance; it does not fetch Git. Staging builds without stopping the service; activation briefly restarts it.
+
+     ```bash
+     sudo bash scripts/update-solominer.sh --check
+     sudo bash scripts/update-solominer.sh --no-restart
+     sudo bash scripts/update-solominer.sh --activate-staged
+     ```
+
+   - **Older unmanaged install** (service and config exist, but the command is absent): migrate with the validated configuration. The installer builds before stopping the service, backs up the old executable and unit for rollback, and installs the managed service and health timer. An imported legacy binary has unknown provenance and may retain old defects.
+
+     ```bash
+     sudo bash scripts/install-solominer.sh --migrate --install-deps
+     ```
+
+5. Verify the release and pool connection. A running service and supervisor telemetry do not by themselves prove a pool job was received. `status` should eventually show a `Last validated job` timestamp; `doctor` may say `Waiting for the first validated Stratum job` during the initial grace period. The first delivered valid-job event is recorded immediately. If no valid job arrives within `HEALTH_TIMEOUT` (900 seconds by default), the supervisor restarts the worker or tries a configured fallback. Check the active pool, failure count, service journal, and pool dashboard. A valid job is not an accepted share or payout; CPU solo mining may go a long time without either. Redact your wallet address before sharing logs.
 
    ```bash
+   sudo /usr/local/bin/solominer doctor
+   sudo /usr/local/bin/solominer status
+   sudo systemctl status btc-solo-cpu.service solominer-health.timer --no-pager
    sudo journalctl -u btc-solo-cpu.service -n 100 --no-pager
    sudo journalctl -u solominer-health.service -n 50 --no-pager
    ```
 
-If prerequisites are missing on a managed installation, rerun the staging command with `--install-deps`. If validation fails, fix the named setting with `sudoedit` and retry. A failed activation attempts to restore the prior release. If the new release is active but operationally unsuitable, run `sudo /usr/local/bin/solominer rollback`, then verify status again. Rollback preserves the current configuration; if an older release cannot parse a newly added setting, restore `/root/btc-solo-cpu.before-update` with `sudo install -m 0640 -o root -g solominer /root/btc-solo-cpu.before-update /etc/sysconfig/btc-solo-cpu` and run `sudo /usr/local/bin/solominer apply-config`.
+If prerequisites are missing on a managed installation, rerun the staging command with `--install-deps`. A failed activation attempts to restore the prior release. If the new release is active but unsuitable, run `sudo /usr/local/bin/solominer rollback` and verify the service. Rollback preserves the live configuration; restore the saved backup if the older release cannot use newer settings. A rollback to an unmanaged legacy install can remove the `solominer` command, so use `systemctl` and the old unit to verify it instead of assuming `apply-config` is available.
 
 ## First installation
 
 ```bash
-git clone https://github.com/jaysonguglietta/solominer.git
-cd solominer
+git clone https://github.com/jaysonguglietta/solominer.git "$HOME/solominer"
+cd "$HOME/solominer"
 sudo bash scripts/install-solominer.sh --install-deps
 ```
 
@@ -173,7 +198,7 @@ The runtime `run` command is for the dedicated systemd service account and rejec
 
 ## Future updates directly from Git
 
-The repository carries management code, approved upstream revision, and mandatory patch. Pulling Git alone does not alter the running service. Follow the staged [upgrade procedure](#upgrade-an-existing-installation) for later releases as well. `sudo bash scripts/update-solominer.sh` activates immediately; `--no-restart` stages, `--activate-staged` activates the matching staged build, and `--check` inspects. `--install-deps` explicitly installs prerequisites; `--update-packages` explicitly requests a Fedora package upgrade. Neither happens by default. Previous shell environment overrides such as `SOURCE_REPO`, `UPDATE_PACKAGES`, and `RESTART_SERVICE` are unsupported; use explicit command options.
+The repository carries management code, approved upstream revision, and mandatory patch. Pulling Git alone does not alter the running service. Follow the staged [upgrade procedure](#upgrade-or-migrate-an-existing-fedora-installation) for later releases as well. `sudo bash scripts/update-solominer.sh` activates immediately; `--no-restart` stages, `--activate-staged` activates the matching staged build, and `--check` inspects. `--install-deps` explicitly installs prerequisites; `--update-packages` explicitly requests a Fedora package upgrade. Neither happens by default. Previous shell environment overrides such as `SOURCE_REPO`, `UPDATE_PACKAGES`, and `RESTART_SERVICE` are unsupported; use explicit command options.
 
 New upstream revisions must be reviewed, pinned, patched, and tested in this repository before adoption. An upstream release does not automatically become an approved update.
 
@@ -187,7 +212,7 @@ sudo systemctl list-timers solominer-health.timer
 sudo journalctl -u solominer-health.service --since today --no-pager
 ```
 
-The timer checks every five minutes after a two-minute startup delay, with a small randomized delay. Health alerts remain local in journald and emit only on new conditions or recovery. It detects stale validated jobs, crashes, overheating, sensor loss, and unusually low CPU progress after a grace period. CPU progress is an advisory signal, with known pauses and restarts excluded. The health checker reads a dedicated miner state file and systemd accounting; it does not need access to the whole system journal. The timer does not email or send webhooks. The supervisor itself restarts or rotates a worker that receives no valid job within `HEALTH_TIMEOUT`. A low-hashrate CPU worker may submit shares rarely; absent shares alone are not an outage signal. Check the pool dashboard for accepted work and payout attribution.
+The timer checks every five minutes after a two-minute startup delay, with a small randomized delay. Health alerts remain local in journald and emit only on new conditions or recovery. It detects stale validated jobs, crashes, overheating, sensor loss, and unusually low CPU progress after a grace period. CPU progress is an advisory signal, with known pauses and restarts excluded. The health checker reads a dedicated miner state file and systemd accounting; it does not need access to the whole system journal. The timer does not email or send webhooks. The supervisor records the first delivered valid-job event immediately, then throttles later state writes. It restarts or rotates a worker that receives no valid job within `HEALTH_TIMEOUT`. A low-hashrate CPU worker may submit shares rarely; absent shares alone are not an outage signal. Check the pool dashboard for accepted work and payout attribution.
 
 ```bash
 sudo systemctl stop btc-solo-cpu.service
