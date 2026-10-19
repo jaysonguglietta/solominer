@@ -198,9 +198,10 @@ def _supervise(config: Any, binary: Path | str, state_path: Path = MINING_STATE)
                                 selector.unregister(key.fd)
                                 continue
                             if b'J' in block:
+                                first_job = last_job_mono is None
                                 last_job_mono = time.monotonic()
                                 state['last_job_at'] = time.time()
-                                if last_job_mono >= next_state_write:
+                                if first_job or last_job_mono >= next_state_write:
                                     _save_mining_state(state_path, state)
                                     next_state_write = last_job_mono + 5
                         if time.monotonic() - (last_job_mono or started_mono) >= config.health_timeout:
