@@ -20,6 +20,7 @@ from .config import ConfigError, DEFAULT_BINARY, DEFAULT_CONFIG, load_config
 
 SERVICE = 'btc-solo-cpu.service'
 DEFAULT_STATE = Path('/var/lib/solominer-health/state.json')
+MINING_STATE = Path('/run/solominer/state.json')
 CPU_SENSORS = {'coretemp', 'k10temp', 'k8temp', 'zenpower', 'cpu_thermal', 'x86_pkg_temp'}
 
 
@@ -120,6 +121,8 @@ def installation(binary: Path | str = DEFAULT_BINARY) -> dict[str, Any]:
 
 
 def run_miner(config_path: Path | str = DEFAULT_CONFIG, binary: Path | str = DEFAULT_BINARY) -> None:
+    if os.geteuid() == 0:
+        raise ConfigError('Refusing to run the miner as root; start btc-solo-cpu.service as the solominer user.')
     config = load_config(config_path)
     for check, target in ((immutable_config, config_path), (immutable_binary, binary)):
         ok, message = check(target)
@@ -128,19 +131,28 @@ def run_miner(config_path: Path | str = DEFAULT_CONFIG, binary: Path | str = DEF
     metadata = installation(binary)
     if not metadata['verified']:
         raise ConfigError(str(metadata['error']))
-    # Argument arrays avoid environment expansion and option injection.
-    if config.fallback_pools:
-        _supervise(config, binary)
-    else:
-        os.execv(str(binary), config.miner_args(binary))
+    # Keep the supervisor alive even with one pool so every miner has a valid-job deadline.
+    _supervise(config, binary)
 
 
-def _supervise(config: Any, binary: Path | str) -> None:
-    """Rotate only administrator-configured pools after bounded retry exhaustion.
+def _save_mining_state(state_path: Path, state: dict[str, Any]) -> None:
+    """Publish a small private snapshot for status and the health service."""
+    descriptor, temporary = tempfile.mkstemp(prefix='.state-', dir=state_path.parent)
+    try:
+        os.fchmod(descriptor, 0o640)
+        with os.fdopen(descriptor, 'w') as output:
+            json.dump(state, output, sort_keys=True)
+            output.write('\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, state_path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
-    cpuminer returns zero on Stratum retry exhaustion, so every unrequested exit
-    is treated as a failure. A requested service stop always stops the child.
-    """
+
+def _supervise(config: Any, binary: Path | str, state_path: Path = MINING_STATE) -> None:
+    """Restart a miner that exits or has no validated Stratum job by its deadline."""
     stopped = threading.Event()
     child = None
 
@@ -152,27 +164,70 @@ def _supervise(config: Any, binary: Path | str) -> None:
     originals = {number: signal.signal(number, stop) for number in (signal.SIGTERM, signal.SIGINT)}
     pools = (config.pool, *config.fallback_pools)
     index = 0
+    failures = 0
+    last_failure = None
     try:
         while not stopped.is_set():
             current = replace(config, pool=pools[index])
-            child = subprocess.Popen(current.miner_args(binary) + ['--retries=3'])
-            if stopped.is_set():
-                child.terminate()
-            while child.poll() is None:
-                try:
-                    child.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    if stopped.is_set():
-                        try:
-                            child.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            child.kill()
-                            child.wait()
-                        break
+            read_fd, write_fd = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+            started_mono = time.monotonic()
+            started_at = time.time()
+            last_job_mono = None
+            failure_reason = None
+            state = {'status': 'starting', 'active_pool': pools[index], 'pool_index': index,
+                     'started_at': started_at, 'last_job_at': None, 'failures': failures,
+                     'last_failure': last_failure, 'pid': None, 'supervisor_pid': os.getpid()}
+            try:
+                environment = os.environ.copy()
+                environment['SOLOMINER_EVENT_FD'] = str(write_fd)
+                child = subprocess.Popen(current.miner_args(binary) + ['--retries=3'],
+                                         env=environment, pass_fds=(write_fd,))
+                os.close(write_fd)
+                write_fd = -1
+                if stopped.is_set() and child.poll() is None:
+                    child.terminate()
+                state.update(status='running', pid=child.pid)
+                _save_mining_state(state_path, state)
+                next_state_write = started_mono + 5
+                with selectors.DefaultSelector() as selector:
+                    selector.register(read_fd, selectors.EVENT_READ)
+                    while not stopped.is_set() and child.poll() is None:
+                        for key, _ in selector.select(timeout=0.5):
+                            block = os.read(key.fd, 4096)
+                            if not block:
+                                selector.unregister(key.fd)
+                                continue
+                            if b'J' in block:
+                                last_job_mono = time.monotonic()
+                                state['last_job_at'] = time.time()
+                                if last_job_mono >= next_state_write:
+                                    _save_mining_state(state_path, state)
+                                    next_state_write = last_job_mono + 5
+                        if time.monotonic() - (last_job_mono or started_mono) >= config.health_timeout:
+                            failure_reason = f'No validated Stratum job for {config.health_timeout} seconds.'
+                            child.terminate()
+                            break
+                if child.poll() is None:
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait()
+                last_failure = failure_reason or f'Miner exited with status {child.returncode}.'
+            finally:
+                os.close(read_fd)
+                if write_fd >= 0:
+                    os.close(write_fd)
             if stopped.is_set():
                 break
+            failures += 1
+            state.update(status='failed', failures=failures, last_failure=last_failure,
+                         last_job_at=state['last_job_at'], pid=None)
+            _save_mining_state(state_path, state)
+            if len(pools) == 1:
+                raise RuntimeError(f'{last_failure} Restarting via systemd.')
             next_index = (index + 1) % len(pools)
-            print(json.dumps({'event': 'pool_failover', 'message': 'Stratum connection failed: miner exited; rotating configured pool after cooldown.',
+            print(json.dumps({'event': 'pool_failover', 'message': last_failure,
                               'previous_pool': pools[index], 'next_pool': pools[next_index],
                               'exit_code': child.returncode, 'cooldown_seconds': max(30, config.retry_pause)}), flush=True)
             if stopped.wait(max(30, config.retry_pause)):
@@ -225,7 +280,7 @@ def temperatures(sysfs: Path | str = '/sys') -> list[dict[str, Any]]:
 
 def service_state() -> dict[str, str]:
     properties = ['ActiveState', 'SubState', 'Result', 'NRestarts', 'MainPID', 'CPUUsageNSec',
-                  'MemoryCurrent', 'TasksCurrent', 'CPUQuotaPerSecUSec', 'MemoryMax', 'TasksMax']
+                  'MemoryCurrent', 'TasksCurrent', 'CPUQuotaPerSecUSec', 'MemoryMax', 'MemorySwapMax', 'TasksMax']
     code, output = _command(['systemctl', 'show', SERVICE, '--no-pager', '--property=' + ','.join(properties)])
     if code:
         return {'error': output[:1000]}
@@ -234,7 +289,8 @@ def service_state() -> dict[str, str]:
 
 def report(config_path: Path | str = DEFAULT_CONFIG, binary: Path | str = DEFAULT_BINARY) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
-    result: dict[str, Any] = {'service': service_state(), 'checks': checks, 'temperatures': temperatures()}
+    result: dict[str, Any] = {'service': service_state(), 'checks': checks, 'temperatures': temperatures(),
+                              'mining': _read_state(MINING_STATE)}
     try:
         config = load_config(config_path)
         result['configuration'] = asdict(config)
@@ -257,6 +313,7 @@ def report(config_path: Path | str = DEFAULT_CONFIG, binary: Path | str = DEFAUL
                 quota_percent = float(quota_match[1]) * {'us': 0.0001, 'ms': 0.1, 's': 100}[quota_match[2]]
             limits_match = (effective.get('MemoryMax') == str(memory_bytes)
                             and effective.get('TasksMax') == str(config.tasks_max)
+                            and effective.get('MemorySwapMax') == '0'
                             and quota_percent is not None
                             and abs(quota_percent - float(config.cpu_quota[:-1])) < 0.01)
             checks.append({'name': 'resource_limits', 'ok': limits_match, 'severity': 'warning',
@@ -279,6 +336,27 @@ def report(config_path: Path | str = DEFAULT_CONFIG, binary: Path | str = DEFAUL
     running = service.get('ActiveState') == 'active' and service.get('SubState') == 'running'
     checks.append({'name': 'service', 'ok': running, 'severity': 'error',
                    'message': 'Miner service is running.' if running else service.get('error', 'Miner service is not running; inspect journalctl -u btc-solo-cpu.service.')})
+    mining = result['mining']
+    main_pid = service.get('MainPID')
+    if running and main_pid and main_pid.isdigit() and main_pid != '0':
+        now = time.time()
+        started_at = mining.get('started_at')
+        telemetry_ok = (mining.get('supervisor_pid') == int(main_pid)
+                        and mining.get('status') == 'running'
+                        and isinstance(started_at, (int, float))
+                        and now - 86400 <= started_at <= now + 5)
+        checks.append({'name': 'mining_telemetry', 'ok': telemetry_ok, 'severity': 'error',
+                       'message': 'Miner supervisor is publishing validated-job telemetry.' if telemetry_ok else
+                       'Miner supervisor telemetry is missing or stale; inspect the service journal.'})
+        if telemetry_ok:
+            last_job = mining.get('last_job_at')
+            valid_job = isinstance(last_job, (int, float)) and started_at <= last_job <= now + 5
+            timeout = result.get('configuration', {}).get('health_timeout', 900)
+            stale = now - (last_job if valid_job else started_at) >= timeout
+            checks.append({'name': 'job_freshness', 'ok': not stale, 'severity': 'error',
+                           'message': ('Validated Stratum job received recently.' if valid_job and not stale else
+                                       'Waiting for the first validated Stratum job.' if not stale else
+                                       f'No validated Stratum job in at least {timeout} seconds; the supervisor will restart or rotate pools.')})
     checks.append({'name': 'cpu_temperature', 'ok': any(reading['source'] == 'hwmon' for reading in result['temperatures']), 'severity': 'warning',
                    'message': 'CPU temperature sensors are readable.' if any(reading['source'] == 'hwmon' for reading in result['temperatures']) else 'No readable CPU hwmon temperature sensors. Thermal cutoff cannot be relied on; inspect lm_sensors and kernel sensor drivers.'})
     result['ok'] = not any(not check['ok'] and check['severity'] == 'error' for check in checks)
@@ -311,32 +389,9 @@ def _save_state(state_path: Path, state: dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
-def _journal(since: float) -> tuple[list[tuple[float, str]], str | None]:
-    code, output = _command(['journalctl', '--unit=' + SERVICE, '--since=@' + str(int(since)),
-                             '--lines=300', '--output=json', '--no-pager', '--quiet'])
-    if code:
-        return [], output[:1000]
-    entries = []
-    for line in output.splitlines():
-        try:
-            record = json.loads(line)
-            message = record.get('MESSAGE')
-            timestamp = float(record['__REALTIME_TIMESTAMP']) / 1000000
-            if isinstance(message, str):
-                entries.append((timestamp, message[:4096]))
-        except (ValueError, TypeError, KeyError):
-            continue
-    return sorted(entries), None
-
-
-_FAILURE = re.compile(r'(stratum.*(?:failed|timeout|timed out|disconnect|interrupted)|connection.*(?:refused|failed|reset)|SSL connect error|certificate.*(?:verification|verify|validation).*failed)', re.I)
-_SUCCESS = re.compile(r'(stratum.*(?:connected|difficulty|new job)|new (?:work|block|job)|accepted(?:\s*[:(]|\s+share))', re.I)
-_REJECT = re.compile(r'(?:rejected|invalid share|unauthorized|authentication failed)', re.I)
-
-
 def health_check(state_path: Path | str = DEFAULT_STATE, config_path: Path | str = DEFAULT_CONFIG,
                  binary: Path | str = DEFAULT_BINARY) -> dict[str, Any]:
-    """Track process, CPU progress, connections, heat and crash loops; silence repeats.
+    """Track process, CPU progress, validated work, heat and crash loops; silence repeats.
 
     No accepted-share deadline is used: solo miners can hash successfully for a
     long time without ever submitting a winning share. Alerts stay local to the
@@ -370,25 +425,6 @@ def health_check(state_path: Path | str = DEFAULT_STATE, config_path: Path | str
     last_check = previous.get('checked_at', now - timeout)
     if not isinstance(last_check, (int, float)) or not now - 86400 <= last_check <= now:
         last_check = now - timeout
-    # Overlap by a second to avoid skipping boundary journal entries.
-    entries, journal_error = _journal(max(now - 86400, last_check - 1))
-    disconnected = previous.get('disconnected_since')
-    if not isinstance(disconnected, (int, float)) or not now - 604800 <= disconnected <= now:
-        disconnected = None
-    rejects = 0
-    for timestamp, message in entries:
-        if _SUCCESS.search(message) and not _FAILURE.search(message):
-            disconnected = None
-        elif _FAILURE.search(message):
-            disconnected = disconnected if disconnected is not None else timestamp
-        if _REJECT.search(message):
-            rejects += 1
-    if journal_error:
-        issues['journal_access'] = 'Health monitor cannot read miner logs: ' + journal_error
-    if disconnected is not None and now - disconnected >= timeout and service.get('ActiveState') == 'active':
-        issues['pool_connection'] = f'Pool connection errors have persisted for at least {timeout} seconds with no subsequent connection/work message.'
-    if rejects >= 5:
-        issues['pool_rejections'] = 'Pool repeatedly rejected work or authentication; verify wallet, worker and pool compatibility in the miner journal.'
     # Compare service CPU accounting rather than accepted shares or log volume.
     # Hashing even at the minimum 1% CPU quota should use much more than 100 ms
     # in a five-minute interval. Warm-up and known pauses never count as stalls.
@@ -408,7 +444,7 @@ def health_check(state_path: Path | str = DEFAULT_STATE, config_path: Path | str
         progress_at = now
     active_worker = service.get('ActiveState') == 'active' and service.get('SubState') == 'running' and bool(pid)
     paused = (not active_worker or config is None or 'overheating' in issues
-              or disconnected is not None or 'pool_rejections' in issues)
+              or 'job_freshness' in issues or 'mining_telemetry' in issues)
     reset_progress = (paused or cpu_ns is None or old_cpu_ns is None or pid != old_pid
                       or cpu_ns < old_cpu_ns
                       or now - last_check > max(timeout * 2, 900))
@@ -422,7 +458,7 @@ def health_check(state_path: Path | str = DEFAULT_STATE, config_path: Path | str
         old_issues = {}
     events = ([{'event': 'alert', 'issue': name, 'message': message} for name, message in sorted(issues.items()) if name not in old_issues]
               + [{'event': 'recovered', 'issue': name, 'message': 'Condition cleared.'} for name in sorted(old_issues) if name not in issues])
-    state = {'checked_at': now, 'restarts': restarts, 'disconnected_since': disconnected, 'issues': issues,
+    state = {'checked_at': now, 'restarts': restarts, 'issues': issues,
              'last_cpu_ns': cpu_ns, 'last_pid': pid, 'last_progress_at': progress_at}
     _save_state(state_path, state)
     return {'ok': not issues, 'changed': bool(events), 'events': events, 'issues': issues,

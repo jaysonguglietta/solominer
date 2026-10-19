@@ -8,6 +8,7 @@ import signal
 import stat
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -25,7 +26,8 @@ class ConfigTests(unittest.TestCase):
         self.path = Path(self.directory.name) / 'settings'
 
     def load(self, extra='', **changes):
-        values = dict(POOL='stratum+tcp://pool.example.org:3333', WALLET=WALLET, WORKER='fedora1', THREADS='2')
+        values = dict(POOL='stratum+tcp://pool.example.org:3333', WALLET=WALLET, WORKER='fedora1',
+                      THREADS='2', ALLOW_INSECURE_POOL='true')
         values.update(changes)
         self.path.write_text(''.join(f'{key}={value}\n' for key, value in values.items()) + extra)
         with patch('solominer.config.os.cpu_count', return_value=4):
@@ -88,10 +90,15 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(pool=pool), self.assertRaises(ConfigError):
                 self.load(POOL=pool)
         with self.assertRaises(ConfigError):
-            self.load('ALLOW_INSECURE_POOL=false\n')
+            self.load(ALLOW_INSECURE_POOL='false')
         with self.assertRaises(ConfigError):
-            self.load('ALLOW_INSECURE_POOL=false\nFALLBACK_POOLS=stratum+tcp://other.org:3333\n', POOL='stratum+ssl://pool.org:3333')
-        self.assertFalse(self.load('ALLOW_INSECURE_POOL=false\n', POOL='stratum+ssl://pool.org:3333').allow_insecure_pool)
+            self.load('FALLBACK_POOLS=stratum+tcp://other.org:3333\n', POOL='stratum+ssl://pool.org:3333', ALLOW_INSECURE_POOL='false')
+        self.assertFalse(self.load(POOL='stratum+ssl://pool.org:3333', ALLOW_INSECURE_POOL='false').allow_insecure_pool)
+
+    def test_plaintext_requires_explicit_opt_in(self):
+        self.path.write_text(f'POOL=stratum+tcp://pool.example.org:3333\nWALLET={WALLET}\nWORKER=fedora1\nTHREADS=2\n')
+        with self.assertRaisesRegex(ConfigError, 'ALLOW_INSECURE_POOL=true'):
+            load_config(self.path)
 
     def test_resource_limits_validate_before_systemd_write(self):
         for extra in ('MAX_TEMP=101\n', 'MAX_TEMP=44\n', 'CPU_QUOTA=401%\n', 'CPU_QUOTA=0%\n',
@@ -120,7 +127,8 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name)
         self.config_path = self.path / 'config'
-        self.config_path.write_text(f'POOL=stratum+tcp://pool.example.org:3333\nWALLET={WALLET}\nWORKER=fedora1\nTHREADS=1\n')
+        self.config_path.write_text(f'POOL=stratum+tcp://pool.example.org:3333\nWALLET={WALLET}\n'
+                                    'WORKER=fedora1\nTHREADS=1\nALLOW_INSECURE_POOL=true\n')
         self.config = load_config(self.config_path)
 
     def test_installation_permissions_include_ancestor_directories(self):
@@ -136,7 +144,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_diagnostics_never_execute_native_miner(self):
         state = {'ActiveState': 'active', 'SubState': 'running', 'MemoryMax': str(256 * 1024**2),
-                 'TasksMax': '64', 'CPUQuotaPerSecUSec': '1s'}
+                 'TasksMax': '64', 'CPUQuotaPerSecUSec': '1s', 'MemorySwapMax': '0'}
         with patch.object(runtime, 'service_state', return_value=state), \
              patch.object(runtime, 'temperatures', return_value=[]), \
              patch.object(runtime, 'immutable_config', return_value=(True, 'ok')), \
@@ -160,7 +168,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_tls_primary_does_not_hide_plaintext_fallback_warning(self):
         self.config_path.write_text(f'POOL=stratum+ssl://secure.example.org:443\nWALLET={WALLET}\n'
-                                    'WORKER=fedora1\nTHREADS=1\nFALLBACK_POOLS=STRATUM+TCP://backup.example.org:3333\n')
+                                    'WORKER=fedora1\nTHREADS=1\nALLOW_INSECURE_POOL=true\n'
+                                    'FALLBACK_POOLS=STRATUM+TCP://backup.example.org:3333\n')
         with patch.object(runtime, 'service_state', return_value={'error': 'fixture'}), \
              patch.object(runtime, 'temperatures', return_value=[]), \
              patch.object(runtime, 'immutable_config', return_value=(True, 'ok')), \
@@ -173,7 +182,7 @@ class RuntimeTests(unittest.TestCase):
     def test_untrusted_binary_never_executes(self):
         with patch.object(runtime, 'immutable_config', return_value=(True, 'ok')), \
              patch.object(runtime, 'immutable_binary', return_value=(False, 'unsafe binary')), \
-             patch.object(runtime.os, 'execv') as execute:
+             patch.object(runtime, '_supervise') as execute:
             with self.assertRaisesRegex(ConfigError, 'unsafe binary'):
                 runtime.run_miner(self.config_path, self.path / 'miner')
             execute.assert_not_called()
@@ -182,18 +191,56 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(runtime, 'immutable_config', return_value=(True, 'ok')), \
              patch.object(runtime, 'immutable_binary', return_value=(True, 'ok')), \
              patch.object(runtime, 'installation', return_value={'verified': False, 'error': 'digest mismatch'}), \
-             patch.object(runtime.os, 'execv') as execute:
+             patch.object(runtime, '_supervise') as execute:
             with self.assertRaisesRegex(ConfigError, 'digest mismatch'):
                 runtime.run_miner(self.config_path, '/opt/cpuminer-opt/cpuminer')
             execute.assert_not_called()
 
-    def test_default_execution_uses_argument_array(self):
+    def test_default_execution_uses_supervisor_even_with_one_pool(self):
         with patch.object(runtime, 'immutable_config', return_value=(True, 'ok')), \
              patch.object(runtime, 'immutable_binary', return_value=(True, 'ok')), \
              patch.object(runtime, 'installation', return_value={'verified': True}), \
-             patch.object(runtime.os, 'execv') as execute:
+             patch.object(runtime, '_supervise') as execute:
             runtime.run_miner(self.config_path, '/opt/cpuminer-opt/cpuminer')
-            execute.assert_called_once_with('/opt/cpuminer-opt/cpuminer', self.config.miner_args())
+            execute.assert_called_once_with(self.config, '/opt/cpuminer-opt/cpuminer')
+
+    def test_root_cannot_run_miner(self):
+        with patch.object(runtime.os, 'geteuid', return_value=0), \
+             patch.object(runtime, '_supervise') as execute:
+            with self.assertRaisesRegex(ConfigError, 'root'):
+                runtime.run_miner(self.config_path)
+            execute.assert_not_called()
+
+    def test_supervisor_restarts_when_no_valid_job_arrives(self):
+        miner = self.path / 'quiet-miner'
+        miner.write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(5)\n')
+        miner.chmod(0o755)
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'No validated Stratum job'):
+            runtime._supervise(replace(self.config, health_timeout=1), miner,
+                               self.path / 'mining.json')
+        self.assertLess(time.monotonic() - started, 4)
+        state = json.loads((self.path / 'mining.json').read_text())
+        self.assertIsNone(state['last_job_at'])
+        self.assertEqual(state['failures'], 1)
+        self.assertEqual((self.path / 'mining.json').stat().st_mode & 0o777, 0o640)
+
+    def test_valid_job_events_keep_miner_alive_until_normal_exit(self):
+        miner = self.path / 'job-miner'
+        miner.write_text('#!/usr/bin/env python3\nimport os, time\n'
+                         'fd = int(os.environ["SOLOMINER_EVENT_FD"])\n'
+                         'for _ in range(8):\n'
+                         '    os.write(fd, b"J")\n'
+                         '    time.sleep(0.2)\n')
+        miner.chmod(0o755)
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, 'exited with status 0'):
+            runtime._supervise(replace(self.config, health_timeout=1), miner,
+                               self.path / 'mining.json')
+        self.assertGreater(time.monotonic() - started, 1)
+        state = json.loads((self.path / 'mining.json').read_text())
+        self.assertIsInstance(state['last_job_at'], float)
+        self.assertEqual(state['failures'], 1)
 
     def test_temperature_enumeration_ignores_gpu(self):
         for number, name, temp in ((0, 'amdgpu', '99000'), (8, 'coretemp', '66000'), (12, 'k10temp', '72000')):
@@ -210,8 +257,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_no_share_deadline_or_repeated_status_noise(self):
         state_path = self.path / 'health/state.json'
-        with patch.object(runtime, 'report', return_value=self.healthy_diagnostics()), \
-             patch.object(runtime, '_journal', return_value=([], None)):
+        with patch.object(runtime, 'report', return_value=self.healthy_diagnostics()):
             first = runtime.health_check(state_path, self.config_path)
             second = runtime.health_check(state_path, self.config_path)
         self.assertTrue(first['ok'])
@@ -219,23 +265,23 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse(second['changed'])
         self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
 
-    def test_connection_alert_persists_and_recovers_once(self):
+    def test_valid_job_alert_persists_and_recovers_once(self):
         state_path = self.path / 'state.json'
         diagnostics = self.healthy_diagnostics()
+        diagnostics['checks'] = [{'name': 'job_freshness', 'ok': False, 'severity': 'error',
+                                  'message': 'No validated Stratum job.'}]
         with patch.object(runtime, 'report', return_value=diagnostics), \
-             patch.object(runtime.time, 'time', return_value=10000), \
-             patch.object(runtime, '_journal', return_value=([(9000, 'Stratum connection failed')], None)):
+             patch.object(runtime.time, 'time', return_value=10000):
             first = runtime.health_check(state_path, self.config_path)
-        self.assertIn('pool_connection', first['issues'])
+        self.assertIn('job_freshness', first['issues'])
         self.assertTrue(first['changed'])
         with patch.object(runtime, 'report', return_value=diagnostics), \
-             patch.object(runtime.time, 'time', return_value=10300), \
-             patch.object(runtime, '_journal', return_value=([], None)):
+             patch.object(runtime.time, 'time', return_value=10300):
             second = runtime.health_check(state_path, self.config_path)
         self.assertFalse(second['changed'])
+        diagnostics['checks'] = []
         with patch.object(runtime, 'report', return_value=diagnostics), \
-             patch.object(runtime.time, 'time', return_value=10600), \
-             patch.object(runtime, '_journal', return_value=([(10500, 'Stratum difficulty set to 0.01')], None)):
+             patch.object(runtime.time, 'time', return_value=10600):
             third = runtime.health_check(state_path, self.config_path)
         self.assertEqual(third['events'][0]['event'], 'recovered')
         self.assertTrue(third['ok'])
@@ -247,21 +293,23 @@ class RuntimeTests(unittest.TestCase):
         diagnostics['service']['NRestarts'] = '4'
         diagnostics['temperatures'][0]['celsius'] = 80
         with patch.object(runtime, 'report', return_value=diagnostics), \
-             patch.object(runtime.time, 'time', return_value=10300), \
-             patch.object(runtime, '_journal', return_value=([], None)):
+             patch.object(runtime.time, 'time', return_value=10300):
             result = runtime.health_check(state_path, self.config_path)
         self.assertIn('overheating', result['issues'])
         self.assertIn('crash_loop', result['issues'])
 
-    def sample_cpu_health(self, now, cpu_ns='1000000000', pid='321', temperature=60, active=True, journal=None):
+    def sample_cpu_health(self, now, cpu_ns='1000000000', pid='321', temperature=60, active=True,
+                          stale_job=False):
         diagnostics = self.healthy_diagnostics()
         diagnostics['service'].update(CPUUsageNSec=cpu_ns, MainPID=pid,
                                       ActiveState='active' if active else 'inactive',
                                       SubState='running' if active else 'dead')
         diagnostics['temperatures'][0]['celsius'] = temperature
+        if stale_job:
+            diagnostics['checks'].append({'name': 'job_freshness', 'ok': False, 'severity': 'error',
+                                           'message': 'No validated Stratum job.'})
         with patch.object(runtime, 'report', return_value=diagnostics), \
-             patch.object(runtime.time, 'time', return_value=now), \
-             patch.object(runtime, '_journal', return_value=(journal or [], None)):
+             patch.object(runtime.time, 'time', return_value=now):
             return runtime.health_check(self.path / 'cpu-state.json', self.config_path)
 
     def test_cpu_progress_warmup_and_hashing_without_shares(self):
@@ -298,14 +346,14 @@ class RuntimeTests(unittest.TestCase):
         state = json.loads((self.path / 'cpu-state.json').read_text())
         self.assertEqual(state['last_progress_at'], 10900)
 
-    def test_known_connection_failures_suppress_idle_worker_alert(self):
+    def test_stale_jobs_suppress_idle_worker_alert(self):
         self.sample_cpu_health(10000)
-        self.sample_cpu_health(10300, journal=[(10200, 'Stratum connection failed')])
-        self.sample_cpu_health(10600)
-        result = self.sample_cpu_health(11200)
-        self.assertIn('pool_connection', result['issues'])
+        self.sample_cpu_health(10300, stale_job=True)
+        self.sample_cpu_health(10600, stale_job=True)
+        result = self.sample_cpu_health(11200, stale_job=True)
+        self.assertIn('job_freshness', result['issues'])
         self.assertNotIn('worker_idle', result['issues'])
-        reconnected = self.sample_cpu_health(11500, journal=[(11400, 'Stratum difficulty set to 0.01')])
+        reconnected = self.sample_cpu_health(11500)
         self.assertNotIn('worker_idle', reconnected['issues'])
 
     def test_unavailable_accounting_never_reports_idle(self):
@@ -341,18 +389,18 @@ class RuntimeTests(unittest.TestCase):
 
     def test_pool_failover_handles_upstream_zero_exit(self):
         config = replace(self.config, fallback_pools=('stratum+tcp://backup.example.org:3333',))
-        child1 = Mock(returncode=0)
+        child1 = Mock(returncode=0, pid=101)
         child1.poll.return_value = 0
-        child2 = Mock(returncode=0)
+        child2 = Mock(returncode=0, pid=102)
         child2.poll.return_value = 0
         stopped = Mock()
-        stopped.is_set.side_effect = [False, False, False, False, False, False]
+        stopped.is_set.side_effect = [False] * 20
         stopped.wait.side_effect = [False, True]
         with patch.object(runtime.threading, 'Event', return_value=stopped), \
              patch.object(runtime.signal, 'signal', return_value=signal.SIG_DFL), \
              patch.object(runtime.subprocess, 'Popen', side_effect=[child1, child2]) as start, \
              patch('sys.stdout', new=io.StringIO()):
-            runtime._supervise(config, '/opt/cpuminer-opt/cpuminer')
+            runtime._supervise(config, '/opt/cpuminer-opt/cpuminer', self.path / 'mining.json')
         self.assertEqual(start.call_count, 2)
         first_args = start.call_args_list[0].args[0]
         second_args = start.call_args_list[1].args[0]
@@ -365,7 +413,7 @@ class RuntimeTests(unittest.TestCase):
     def test_requested_stop_never_rotates_pool(self):
         config = replace(self.config, fallback_pools=('stratum+tcp://backup.example.org:3333',))
         handlers = {}
-        child = Mock(returncode=0)
+        child = Mock(returncode=0, pid=101)
         child.poll.return_value = 0
 
         def register(number, handler):
@@ -379,9 +427,9 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(runtime.signal, 'signal', side_effect=register), \
              patch.object(runtime.subprocess, 'Popen', side_effect=start_child) as start, \
              patch('sys.stdout', new=io.StringIO()) as output:
-            runtime._supervise(config, '/opt/cpuminer-opt/cpuminer')
+            runtime._supervise(config, '/opt/cpuminer-opt/cpuminer', self.path / 'mining.json')
         self.assertEqual(start.call_count, 1)
-        child.terminate.assert_called_once()
+        child.terminate.assert_not_called()  # It had already exited when stop arrived.
         self.assertEqual(output.getvalue(), '')
 
 

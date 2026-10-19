@@ -6,7 +6,7 @@ check this exact commit, run `git apply --check`, and apply this patch before
 building. A failed or partially applied patch must abort the update. Never apply
 it opportunistically to an arbitrary upstream revision.
 
-The patch changes `util.c` and `sysinfos.c`:
+The patch changes `util.c`, `cpu-miner.c`, `miner.h`, and `sysinfos.c`:
 
 - RPC HTTPS and Stratum TLS require certificate-chain verification and hostname
   matching. `--cert` supplies an optional CA bundle for both transports. Without
@@ -23,6 +23,25 @@ The patch changes `util.c` and `sysinfos.c`:
 - Send/receive byte counts passed to modern libcurl use `size_t` objects. This
   removes upstream's cast from `int *` to `size_t *` in `curl_easy_send`, which
   writes beyond the four-byte object on 64-bit systems.
+- Stratum extranonce and job fields are bounded and checked as complete hex
+  before publication. A candidate job is allocated and decoded separately;
+  malformed messages and allocation failures preserve the previous complete
+  job. Merkle allocations are freed by allocated capacity, not the most recent
+  branch count. The block-height scanner checks every index before reading.
+  Rejected notifications cannot mark a new job or be mistaken for share
+  responses. Work generation uses the extranonce length stored with its job,
+  even when a pool sends a new extranonce size before another job.
+  Current limits are a 128-byte printable ASCII job ID, 64-byte extranonce1,
+  64 KiB assembled coinbase, and 1,024 Merkle branches. A pool exceeding these
+  limits is rejected rather than allocating unbounded memory.
+- After a complete, valid job has been turned into usable work, the miner
+  writes a single `J` byte to the inherited decimal `SOLOMINER_EVENT_FD` if set.
+  The pipe is supplied by SoloMiner's supervisor. Invalid jobs and work
+  allocation failures never produce an event, and no pool content enters the
+  event channel. The miner works normally when the variable is absent. The
+  descriptor is made nonblocking, so an undrained pipe cannot
+  stall mining; a full or closed pipe can drop an event without invalidating
+  the job. A closed pipe does not terminate the miner through `SIGPIPE`.
 - Linux CPU temperature detection enumerates hwmon devices instead of assuming
   fixed boot-dependent hwmon numbers. Only `coretemp`, `k10temp`, `k8temp`,
   `zenpower`, `cpu_thermal`, and `x86_pkg_temp` are eligible. The hottest valid
@@ -40,8 +59,9 @@ of cpuminer-opt's algorithm implementations, JSON handlers, or other transports.
 ## Offline regression validation
 
 The test suite compiles the actual postimage C functions extracted from this
-patch with synthetic transport, allocator, and hwmon fixtures. It never launches
-a miner or connects to a pool.
+patch with synthetic transport, allocator, Stratum JSON, and hwmon fixtures. It
+tests short coinbases, malformed fields, branch resizing, allocation failure,
+and valid-job event emission. It never launches a miner or connects to a pool.
 
 ```bash
 SANITIZE=1 python3 -m unittest discover -s tests -v
