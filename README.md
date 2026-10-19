@@ -25,7 +25,7 @@ Fedora Atomic variants (including Silverblue and Kinoite) have a different files
 
 The CI build uses a Fedora 44 container. Validate the real service on the Fedora release and hardware you intend to use; the container does not exercise host systemd or SELinux.
 
-The installer can install Fedora build prerequisites with `--install-deps`. It does not upgrade the operating system by default. Continue normal Fedora security maintenance separately.
+The installer can install Fedora build prerequisites with `--install-deps`. It does not upgrade the operating system by default. Use the [manual updater](#manual-fedora-and-solominer-updates) or your normal Fedora maintenance process for security updates.
 
 ## Upgrade or migrate an existing Fedora installation
 
@@ -198,9 +198,74 @@ The runtime `run` command is for the dedicated systemd service account and rejec
 
 ## Future updates directly from Git
 
-The repository carries management code, approved upstream revision, and mandatory patch. Pulling Git alone does not alter the running service. Follow the staged [upgrade procedure](#upgrade-or-migrate-an-existing-fedora-installation) for later releases as well. `sudo bash scripts/update-solominer.sh` activates immediately; `--no-restart` stages, `--activate-staged` activates the matching staged build, and `--check` inspects. `--install-deps` explicitly installs prerequisites; `--update-packages` explicitly requests a Fedora package upgrade. Neither happens by default. Previous shell environment overrides such as `SOURCE_REPO`, `UPDATE_PACKAGES`, and `RESTART_SERVICE` are unsupported; use explicit command options.
+The repository carries management code, approved upstream revision, and mandatory patch. Pulling Git alone does not alter the running service. Follow the staged [upgrade procedure](#upgrade-or-migrate-an-existing-fedora-installation) for later releases, or install the [manual updater](#manual-fedora-and-solominer-updates) for occasional operator-controlled updates. `sudo bash scripts/update-solominer.sh` activates immediately; `--no-restart` stages, `--activate-staged` activates the matching staged build, and `--check` compares the checkout with the installed release. `--install-deps` explicitly installs prerequisites; `--update-packages` explicitly requests a Fedora package upgrade. Neither happens by default. Previous shell environment overrides such as `SOURCE_REPO`, `UPDATE_PACKAGES`, and `RESTART_SERVICE` are unsupported; use explicit command options.
 
 New upstream revisions must be reviewed, pinned, patched, and tested in this repository before adoption. An upstream release does not automatically become an approved update.
+
+## Manual Fedora and SoloMiner updates
+
+For a traditional Fedora host with a managed SoloMiner installation, `scripts/manual-update.sh` provides a command you can keep at `/etc/solominer/update.sh` and run when you choose. It has no timer or automatic reboot. It updates Fedora RPMs, SoloMiner code, or both only when you select the corresponding mode. Code-related modes require a clean, root-owned `/root/solominer` checkout on `main`, connected to the expected SoloMiner GitHub remote. It is separate from `/opt/cpuminer-opt`.
+
+Install the script once from a checkout whose contents you have reviewed. Run this block in a root shell (`sudo -i` if needed), since a normal user cannot access `/root/solominer`. It stops if the branch, remote, or worktree is unexpected, and asks you to type the complete reviewed SHA before installing anything. The checkout must already exist; see [Upgrade or migrate an existing Fedora installation](#upgrade-or-migrate-an-existing-fedora-installation) if it does not. Read the displayed diff, especially changes to `scripts/manual-update.sh`, before entering the SHA:
+
+```bash
+(
+  set -e
+  cd /root/solominer
+  test ! -L /root/solominer
+  test -d /root/solominer/.git && test ! -L /root/solominer/.git
+  bad_path=$(find /root/solominer -xdev \( -type l -o ! -user root -o ! -group root -o -perm /022 \) -print -quit)
+  test -z "$bad_path"
+  test "$(git remote get-url origin)" = 'https://github.com/jaysonguglietta/solominer.git'
+  test "$(git branch --show-current)" = main
+  dirty=$(git status --porcelain=v1 --untracked-files=all)
+  test -z "$dirty"
+  git -c core.hooksPath=/dev/null fetch --no-tags origin main
+  reviewed_sha=$(git rev-parse 'FETCH_HEAD^{commit}')
+  git merge-base --is-ancestor HEAD "$reviewed_sha"
+  git --no-pager log --oneline "HEAD..$reviewed_sha"
+  git --no-pager diff --stat --no-ext-diff --no-textconv HEAD "$reviewed_sha"
+  git --no-pager diff --no-ext-diff --no-textconv HEAD "$reviewed_sha"
+  read -r -p 'Type the full reviewed commit SHA to install the updater: ' approved_sha
+  test "$approved_sha" = "$reviewed_sha"
+  git -c core.hooksPath=/dev/null merge --ff-only "$reviewed_sha"
+  install -d -m 0755 -o root -g root /etc/solominer
+  install -m 0700 -o root -g root scripts/manual-update.sh /etc/solominer/update.sh
+)
+```
+
+For each maintenance session, start with a non-installing update check. It fetches the repository's `main` branch from its fixed HTTPS URL and reports the complete Git commit ID, incoming commits and change summary, and available Fedora package updates; it does not activate code or install RPMs. It can update the local Git object store and DNF metadata. A bare invocation has the same behavior:
+
+```bash
+sudo /etc/solominer/update.sh --check
+```
+
+Use the **full 40-character commit ID** printed by `--check` in the next commands, replacing `COMMIT_SHA` below. Run the Git review commands in a root shell. Before a SoloMiner code update, inspect the complete incoming diff and any changes to root-run scripts, the pinned source, patch, service units, and dependency list. The commit ID is an explicit choice of what to install: if `main` moves after the check, the updater stops and asks you to check and review again.
+
+```bash
+git -C /root/solominer --no-pager log --oneline HEAD..COMMIT_SHA
+git -C /root/solominer --no-pager diff --stat --no-ext-diff --no-textconv HEAD COMMIT_SHA
+git -C /root/solominer --no-pager diff --no-ext-diff --no-textconv HEAD COMMIT_SHA
+sudo /etc/solominer/update.sh --miner COMMIT_SHA
+```
+
+Choose `--packages` to run `dnf upgrade --refresh` without changing the SoloMiner Git checkout. It requires a terminal and asks you to type `UPGRADE` before invoking DNF. This upgrades eligible RPMs across the **whole Fedora system**, not only SoloMiner prerequisites. Choose `--all COMMIT_SHA` to run that DNF transaction first and then update SoloMiner from the reviewed commit. A failed package transaction stops the combined update before the SoloMiner code step. If the remote `main` moves during the package transaction, the RPMs remain updated and the code step stops until you review the new commit. Neither mode performs a Fedora release upgrade or reboots the machine.
+
+```bash
+sudo /etc/solominer/update.sh --packages
+sudo /etc/solominer/update.sh --all COMMIT_SHA
+```
+
+The code modes fast-forward the checked-out `main` branch, stage the managed build, activate it, then run `doctor` and `status`. Activation can briefly interrupt mining. The updater script in `/etc` is a separate root-owned copy: a SoloMiner code update does not silently replace it. After reviewing a newer `scripts/manual-update.sh`, repeat the `sudo install -m 0700 ...` command above to refresh the copy.
+
+Check the service and validated-job timestamp after maintenance. A package update can require an operator-controlled reboot or restart of affected services; SoloMiner rollback does **not** undo Fedora RPM upgrades. If a code activation fails, inspect the output and journal; the managed updater attempts to recover the prior release. If a new SoloMiner release runs but is unsuitable, use `sudo /usr/local/bin/solominer rollback` and verify it again. A rollback does not rewind `/root/solominer`, so review that checkout before a later retry.
+
+```bash
+sudo /usr/local/bin/solominer doctor
+sudo /usr/local/bin/solominer status
+sudo systemctl status btc-solo-cpu.service --no-pager
+sudo journalctl -u btc-solo-cpu.service -n 100 --no-pager
+```
 
 ## Monitoring and service management
 
@@ -226,6 +291,7 @@ sudo systemctl disable --now btc-solo-cpu.service solominer-health.timer
 - `/usr/local/bin/solominer`: root-owned management entry point.
 - `/usr/local/libexec/solominer/releases/`: immutable, root-owned management releases activated together.
 - `/etc/sysconfig/btc-solo-cpu`: root-owned configuration.
+- `/etc/solominer/update.sh`: optional, root-owned manual update command copied from a reviewed checkout.
 - `/etc/systemd/system/btc-solo-cpu.service`: miner sandbox and resource-limit drop-in.
 - `/etc/systemd/system/solominer-health.service` and `.timer`: local health checks.
 - `/opt/cpuminer-opt`: root-owned active binary and provenance.
@@ -245,6 +311,8 @@ Keep SELinux enabled. The installer does not loosen SELinux policy or open firew
 
 **Activation fails:** the updater attempts to restore the previous release. `apply-config --from` also restores the last working configuration after a failed candidate. Inspect `solominer status` and the service journal. If both releases fail, repair configuration/pool access before restarting.
 
+**Manual updater refuses to run:** verify that `/root/solominer` is the clean, root-owned SoloMiner `main` checkout and that its `origin` is the expected repository. If `main` advanced after `--check`, inspect the new diff and use its new full commit ID. Do not bypass ownership, remote, or clean-worktree checks. If DNF fails, resolve the Fedora package error before retrying; SoloMiner rollback cannot restore RPMs.
+
 **Pool connection or job freshness fails:** verify the provider's current host/port/transport, DNS, outbound firewall, system time, and CA store. Inspect the active pool and last validated job in `solominer status`. Do not disable certificate verification. Local startup success does not prove network connectivity or valid work.
 
 **Sensor missing:** inspect `sensors` and `/sys/class/hwmon`. `MAX_TEMP` works only if the miner can read a relevant CPU sensor. Diagnose hardware/kernel support before relying on it. CPU quotas are independent containment, not a thermal guarantee.
@@ -259,7 +327,7 @@ Local tests need no miner or pool connection:
 
 ```bash
 python3 -m unittest discover -s tests -v
-bash -n scripts/install-solominer.sh scripts/update-solominer.sh tests/fedora_acceptance.sh
+bash -n scripts/install-solominer.sh scripts/update-solominer.sh scripts/manual-update.sh tests/fedora_acceptance.sh
 ```
 
 CI runs Python tests and shell linting on Ubuntu, plus a full pinned/patched upstream build as an unprivileged account and systemd unit verification in a Fedora container. A disposable Ubuntu VM also executes the actual systemd build sandbox, activation, configuration, staging, rollback, and health units using a harmless compiled fixture. The fixture never mines or contacts a pool; the test refuses any preexisting SoloMiner installation and cleans up its own files/accounts.
